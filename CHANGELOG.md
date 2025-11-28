@@ -7,6 +7,9 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.4 (2025-11-27)
+* Updated package links with split behavior
+
 ## 0.3.3 (2025-11-27)
 * Changed package links to use require-by-string
 
