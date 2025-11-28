@@ -10,8 +10,10 @@ on:
 jobs:
   fetch_tag:
     if: |
-      github.event_name == 'push' ||
-      contains(github.event.pull_request.labels.*.name, 'built-as-nightly')
+      github.repository == 'UpliftGames/wally' && (
+        github.event_name == 'push' ||
+        contains(github.event.pull_request.labels.*.name, 'built-as-nightly')
+      )
     runs-on: ubuntu-latest
     name: Build nightly release
     outputs:
@@ -33,6 +35,7 @@ jobs:
         run: echo "tag=${{ steps.previoustag.outputs.tag }}" >> "$GITHUB_OUTPUT"
 
   build:
+    if: github.repository == 'UpliftGames/wally'
     uses: ./.github/workflows/build.yml
     needs: fetch_tag
     with:

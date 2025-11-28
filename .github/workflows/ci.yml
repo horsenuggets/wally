@@ -33,9 +33,10 @@ jobs:
 
     - name: Run tests
       run: cargo test --verbose --locked
+      if: github.repository == 'UpliftGames/wally'
 
     - name: Rustfmt and Clippy
       run: |
         cargo fmt -- --check
         cargo clippy
-      if: matrix.rust_version == 'stable'
+      if: matrix.rust_version == 'stable' && github.repository == 'UpliftGames/wally'
