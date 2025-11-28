@@ -7,6 +7,9 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.3 (2025-11-27)
+* Changed package links to use require-by-string
+
 ## 0.3.2 (2023-06-05)
 * Added private field to package manifest ([#9])([#76])
 * Improved lockfile generation **lockfiles will change** ([#130])
