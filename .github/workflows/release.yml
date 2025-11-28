@@ -7,7 +7,6 @@ on:
 
 jobs:
   create-release:
-    if: endsWith(github.ref, 'main')
     name: Create Release
     runs-on: ubuntu-latest
     outputs:
