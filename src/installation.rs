@@ -179,10 +179,10 @@ impl InstallationContext {
     /// Contents of a package-to-package link within the same index.
     fn link_sibling_same_index(&self, id: &PackageId) -> String {
         formatdoc! {r#"
-            if game then
-                return require(script.Parent.Parent["{full_name}"]["{short_name}"])
-            else
+            if not game then
                 return require("../{full_name}/{short_name}")
+            else
+                return require(script.Parent.Parent["{full_name}"]["{short_name}"])
             end
             "#,
             full_name = package_id_file_name(id),
@@ -193,10 +193,10 @@ impl InstallationContext {
     /// Contents of a root-to-package link within the same index.
     fn link_root_same_index(&self, id: &PackageId) -> String {
         formatdoc! {r#"
-            if game then
-                return require(script.Parent._Index["{full_name}"]["{short_name}"])
-            else
+            if not game then
                 return require("./_Index/{full_name}/{short_name}")
+            else
+                return require(script.Parent._Index["{full_name}"]["{short_name}"])
             end
             "#,
             full_name = package_id_file_name(id),

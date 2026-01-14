@@ -5,3 +5,6 @@
 *.snap.new
 
 *.DS_Store
+
+.local
+.vscode
