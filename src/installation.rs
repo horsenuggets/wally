@@ -185,10 +185,11 @@ impl InstallationContext {
     /// Contents of a package-to-package link within the same index.
     fn link_sibling_same_index(&self, id: &PackageId) -> String {
         formatdoc! {r#"
+            type Package = typeof(require("../{full_name}/{short_name}"))
             if not game then
-                return require("../{full_name}/{short_name}")
+                return require("../{full_name}/{short_name}") :: Package
             else
-                return require(script.Parent.Parent["{full_name}"]["{short_name}"])
+                return require(script.Parent.Parent["{full_name}"]["{short_name}"]) :: Package
             end
             "#,
             full_name = package_id_file_name(id),
@@ -199,10 +200,11 @@ impl InstallationContext {
     /// Contents of a root-to-package link within the same index.
     fn link_root_same_index(&self, id: &PackageId) -> String {
         formatdoc! {r#"
+            type Package = typeof(require("./_Index/{full_name}/{short_name}"))
             if not game then
-                return require("./_Index/{full_name}/{short_name}")
+                return require("./_Index/{full_name}/{short_name}") :: Package
             else
-                return require(script.Parent._Index["{full_name}"]["{short_name}"])
+                return require(script.Parent._Index["{full_name}"]["{short_name}"]) :: Package
             end
             "#,
             full_name = package_id_file_name(id),
@@ -226,7 +228,8 @@ impl InstallationContext {
         })?;
 
         let contents = formatdoc! {r#"
-            return require({packages}._Index["{full_name}"]["{short_name}"])
+            type Package = typeof(require({packages}._Index["{full_name}"]["{short_name}"]))
+            return require({packages}._Index["{full_name}"]["{short_name}"]) :: Package
             "#,
             packages = shared_path,
             full_name = package_id_file_name(id),
@@ -252,7 +255,8 @@ impl InstallationContext {
         })?;
 
         let contents = formatdoc! {r#"
-            return require({packages}._Index["{full_name}"]["{short_name}"])
+            type Package = typeof(require({packages}._Index["{full_name}"]["{short_name}"]))
+            return require({packages}._Index["{full_name}"]["{short_name}"]) :: Package
             "#,
             packages = server_path,
             full_name = package_id_file_name(id),

@@ -3,21 +3,21 @@ source: tests/integration/install.rs
 expression: result
 ---
 DevPackages:
-  Minimal.luau: "return require(game.ServerScriptStorage.Packages._Index[\"biff_minimal@0.1.0\"][\"minimal\"])\n"
+  Minimal.luau: "type Package = typeof(require(game.ServerScriptStorage.Packages._Index[\"biff_minimal@0.1.0\"][\"minimal\"]))\nreturn require(game.ServerScriptStorage.Packages._Index[\"biff_minimal@0.1.0\"][\"minimal\"]) :: Package\n"
 ServerPackages:
-  Minimal.luau: "if not game then\n    return require(\"./_Index/biff_minimal@0.1.0/minimal\")\nelse\n    return require(script.Parent._Index[\"biff_minimal@0.1.0\"][\"minimal\"])\nend\n"
-  OneDependency.luau: "if not game then\n    return require(\"./_Index/biff_one-dependency@0.1.0/one-dependency\")\nelse\n    return require(script.Parent._Index[\"biff_one-dependency@0.1.0\"][\"one-dependency\"])\nend\n"
-  Transitive.luau: "if not game then\n    return require(\"./_Index/biff_transitive-dependency@0.1.0/transitive-dependency\")\nelse\n    return require(script.Parent._Index[\"biff_transitive-dependency@0.1.0\"][\"transitive-dependency\"])\nend\n"
+  Minimal.luau: "type Package = typeof(require(\"./_Index/biff_minimal@0.1.0/minimal\"))\nif not game then\n    return require(\"./_Index/biff_minimal@0.1.0/minimal\") :: Package\nelse\n    return require(script.Parent._Index[\"biff_minimal@0.1.0\"][\"minimal\"]) :: Package\nend\n"
+  OneDependency.luau: "type Package = typeof(require(\"./_Index/biff_one-dependency@0.1.0/one-dependency\"))\nif not game then\n    return require(\"./_Index/biff_one-dependency@0.1.0/one-dependency\") :: Package\nelse\n    return require(script.Parent._Index[\"biff_one-dependency@0.1.0\"][\"one-dependency\"]) :: Package\nend\n"
+  Transitive.luau: "type Package = typeof(require(\"./_Index/biff_transitive-dependency@0.1.0/transitive-dependency\"))\nif not game then\n    return require(\"./_Index/biff_transitive-dependency@0.1.0/transitive-dependency\") :: Package\nelse\n    return require(script.Parent._Index[\"biff_transitive-dependency@0.1.0\"][\"transitive-dependency\"]) :: Package\nend\n"
   _Index:
     biff_minimal@0.1.0:
       minimal:
         init.lua: "return \"hey\""
     biff_one-dependency@0.1.0:
-      Minimal.luau: "if not game then\n    return require(\"../biff_minimal@0.1.0/minimal\")\nelse\n    return require(script.Parent.Parent[\"biff_minimal@0.1.0\"][\"minimal\"])\nend\n"
+      Minimal.luau: "type Package = typeof(require(\"../biff_minimal@0.1.0/minimal\"))\nif not game then\n    return require(\"../biff_minimal@0.1.0/minimal\") :: Package\nelse\n    return require(script.Parent.Parent[\"biff_minimal@0.1.0\"][\"minimal\"]) :: Package\nend\n"
       one-dependency:
         init.lua: "return \"hey\""
     biff_transitive-dependency@0.1.0:
-      OneDependency.luau: "if not game then\n    return require(\"../biff_one-dependency@0.1.0/one-dependency\")\nelse\n    return require(script.Parent.Parent[\"biff_one-dependency@0.1.0\"][\"one-dependency\"])\nend\n"
+      OneDependency.luau: "type Package = typeof(require(\"../biff_one-dependency@0.1.0/one-dependency\"))\nif not game then\n    return require(\"../biff_one-dependency@0.1.0/one-dependency\") :: Package\nelse\n    return require(script.Parent.Parent[\"biff_one-dependency@0.1.0\"][\"one-dependency\"]) :: Package\nend\n"
       transitive-dependency:
         init.lua: "return \"hey\""
 default.project.json: "{\n\t\"name\": \"dev-dependency\",\n\t\"tree\": {\n\t\t\"$path\": \"src\"\n\t}\n}"

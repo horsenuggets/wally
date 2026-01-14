@@ -3,7 +3,7 @@ source: tests/integration/install.rs
 expression: result
 ---
 ServerPackages:
-  Minimal.luau: "if not game then\n    return require(\"./_Index/biff_minimal@0.1.0/minimal\")\nelse\n    return require(script.Parent._Index[\"biff_minimal@0.1.0\"][\"minimal\"])\nend\n"
+  Minimal.luau: "type Package = typeof(require(\"./_Index/biff_minimal@0.1.0/minimal\"))\nif not game then\n    return require(\"./_Index/biff_minimal@0.1.0/minimal\") :: Package\nelse\n    return require(script.Parent._Index[\"biff_minimal@0.1.0\"][\"minimal\"]) :: Package\nend\n"
   _Index:
     biff_minimal@0.1.0:
       minimal:
