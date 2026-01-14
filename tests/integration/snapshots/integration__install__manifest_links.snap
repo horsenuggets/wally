@@ -1,7 +1,6 @@
 ---
 source: tests/integration/install.rs
 expression: result
-snapshot_kind: text
 ---
 default.project.json: "{\n  \"name\": \"minimal\",\n  \"tree\": {\n    \"$path\": \"src\"\n  }\n}"
 src:

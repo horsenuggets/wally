@@ -7,6 +7,10 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.2-horse.0.3 (2026-01-14)
+* Changed generated link files from .lua to .luau extension
+* Fixed @packages alias for transitive dependencies by creating top-level links for all packages
+
 ## 0.3.2-horse.0.2 (2025-11-27)
 * Updated package links with split behavior
 

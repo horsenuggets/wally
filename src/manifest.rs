@@ -105,7 +105,7 @@ pub struct Package {
     /// If include is unspecified and a .gitignore file exists then those patterns
     /// will be respected and wally will also ignore those files.
     ///
-    /// Example: ["/src", "*.lua"]
+    /// Example: ["/src", "*.luau"]
     #[serde(default)]
     pub include: Vec<String>,
 

@@ -130,14 +130,20 @@ impl InstallationContext {
 
                 if let Some(deps) = shared_deps {
                     self.write_package_links(&package_id, package_realm, deps, &resolved)?;
+                    // Also create top-level links so @packages alias works
+                    self.write_root_package_links(Realm::Shared, deps, &resolved)?;
                 }
 
                 if let Some(deps) = server_deps {
                     self.write_package_links(&package_id, package_realm, deps, &resolved)?;
+                    // Also create top-level links so @packages alias works
+                    self.write_root_package_links(Realm::Server, deps, &resolved)?;
                 }
 
                 if let Some(deps) = dev_deps {
                     self.write_package_links(&package_id, package_realm, deps, &resolved)?;
+                    // Also create top-level links so @packages alias works
+                    self.write_root_package_links(Realm::Dev, deps, &resolved)?;
                 }
 
                 let source_registry = resolved_copy.metadata[&package_id].source_registry.clone();
@@ -275,7 +281,7 @@ impl InstallationContext {
 
         for (dep_name, dep_package_id) in dependencies {
             let dependencies_realm = resolved.metadata.get(dep_package_id).unwrap().origin_realm;
-            let path = base_path.join(format!("{}.lua", dep_name));
+            let path = base_path.join(format!("{}.luau", dep_name));
 
             let contents = match (root_realm, dependencies_realm) {
                 (source, dest) if source == dest => self.link_root_same_index(dep_package_id),
@@ -315,7 +321,7 @@ impl InstallationContext {
 
         for (dep_name, dep_package_id) in dependencies {
             let dependencies_realm = resolved.metadata.get(dep_package_id).unwrap().origin_realm;
-            let path = base_path.join(format!("{}.lua", dep_name));
+            let path = base_path.join(format!("{}.luau", dep_name));
 
             let contents = match (package_realm, dependencies_realm) {
                 (source, dest) if source == dest => self.link_sibling_same_index(dep_package_id),
