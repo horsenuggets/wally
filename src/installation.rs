@@ -361,6 +361,10 @@ impl InstallationContext {
         fs::create_dir_all(&path)?;
         contents.unpack_into_path(&path)?;
 
+        // Create .luaurc so @packages/@devpackages/@self resolve correctly
+        // for this package's own dependencies
+        create_package_luaurc(&path)?;
+
         Ok(())
     }
 }
@@ -373,4 +377,34 @@ fn package_id_file_name(id: &PackageId) -> String {
         id.name().name(),
         id.version()
     )
+}
+
+/// Creates a .luaurc file inside the package that defines aliases for dependency resolution.
+/// This allows packages to use:
+/// - @packages/... requires which resolve to the package's own dependencies
+/// - @devpackages/... requires which resolve to the package's own dev dependencies
+/// - @self/... requires which resolve to the package's source root
+fn create_package_luaurc(package_path: &Path) -> anyhow::Result<()> {
+    let luaurc_path = package_path.join(".luaurc");
+
+    // Don't overwrite if one already exists
+    if luaurc_path.exists() {
+        return Ok(());
+    }
+
+    // The package source is at _Index/pkgname@version/shortname/
+    // The dependency links are at _Index/pkgname@version/
+    // So we need to go up one level ("../") to reach the dependency folder
+    let luaurc_content = r#"{
+    "aliases": {
+        "packages": "../",
+        "devpackages": "../"
+    }
+}
+"#;
+
+    fs::write(luaurc_path, luaurc_content)?;
+    log::trace!("Created .luaurc in {}", package_path.display());
+
+    Ok(())
 }
