@@ -1,31 +1,31 @@
 ---
 source: src/resolution.rs
-expression: resolve
+expression: resolved
 ---
 activated:
+  - biff/dev-dep@1.0.0
   - biff/root@1.0.0
-  - biff/server@1.0.0
-  - biff/shared@1.0.0
+  - biff/test-util@1.0.0
 metadata:
+  biff/dev-dep@1.0.0:
+    realm: shared
+    origin_realms:
+      - dev
+    source_registry: DefaultRegistry
   biff/root@1.0.0:
     realm: shared
     origin_realms:
       - shared
     source_registry: DefaultRegistry
-  biff/server@1.0.0:
-    realm: server
-    origin_realms:
-      - server
-    source_registry: DefaultRegistry
-  biff/shared@1.0.0:
+  biff/test-util@1.0.0:
     realm: shared
     origin_realms:
-      - server
+      - dev
     source_registry: DefaultRegistry
 shared_dependencies: {}
-server_dependencies:
+server_dependencies: {}
+dev_dependencies:
+  biff/dev-dep@1.0.0:
+    TestUtil: biff/test-util@1.0.0
   biff/root@1.0.0:
-    Server: biff/server@1.0.0
-  biff/server@1.0.0:
-    Shared: biff/shared@1.0.0
-dev_dependencies: {}
+    DevDep: biff/dev-dep@1.0.0

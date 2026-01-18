@@ -1,0 +1,42 @@
+---
+source: src/resolution.rs
+expression: resolved
+---
+activated:
+  - biff/dev-dep@1.0.0
+  - biff/regular-dep@1.0.0
+  - biff/root@1.0.0
+  - biff/shared-util@1.0.0
+metadata:
+  biff/dev-dep@1.0.0:
+    realm: shared
+    origin_realms:
+      - dev
+    source_registry: DefaultRegistry
+  biff/regular-dep@1.0.0:
+    realm: shared
+    origin_realms:
+      - shared
+    source_registry: DefaultRegistry
+  biff/root@1.0.0:
+    realm: shared
+    origin_realms:
+      - shared
+    source_registry: DefaultRegistry
+  biff/shared-util@1.0.0:
+    realm: shared
+    origin_realms:
+      - shared
+      - dev
+    source_registry: DefaultRegistry
+shared_dependencies:
+  biff/dev-dep@1.0.0:
+    SharedUtil: biff/shared-util@1.0.0
+  biff/regular-dep@1.0.0:
+    SharedUtil: biff/shared-util@1.0.0
+  biff/root@1.0.0:
+    RegularDep: biff/regular-dep@1.0.0
+server_dependencies: {}
+dev_dependencies:
+  biff/root@1.0.0:
+    DevDep: biff/dev-dep@1.0.0

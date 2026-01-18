@@ -3,24 +3,33 @@ source: tests/integration/install.rs
 expression: result
 ---
 Packages:
-  Minimal.luau: "type Package = typeof(require(\"./_Index/biff_minimal-shared@0.1.0/minimal-shared\"))\nif not game then\n    return require(\"./_Index/biff_minimal-shared@0.1.0/minimal-shared\") :: Package\nelse\n    return require(script.Parent._Index[\"biff_minimal-shared@0.1.0\"][\"minimal-shared\"]) :: Package\nend\n"
+  Minimal.luau: "type Package = typeof(require(\"./_Index/biff_minimal-shared@0.1.0/minimal-shared\"))\nreturn require(\"./_Index/biff_minimal-shared@0.1.0/minimal-shared\") :: Package\n"
   _Index:
     biff_minimal-shared@0.1.0:
       minimal-shared:
+        ".luaurc": "{\n    \"aliases\": {\n        \"packages\": \"../\",\n        \"devpackages\": \"../\"\n    }\n}\n"
         default.project.json: "{\n  \"name\": \"minimal-shared\",\n  \"tree\": {\n    \"$path\": \"src\"\n  }\n}"
         src:
           init.lua: "return \"hey\""
         wally.toml: "[package]\nname = \"biff/minimal-shared\"\nversion = \"0.1.0\"\nlicense = \"MIT\"\nrealm = \"shared\"\nregistry = \"test-registries/primary-registry\"\n"
 ServerPackages:
   _Index:
+    biff_minimal-shared@0.1.0:
+      minimal-shared:
+        ".luaurc": "{\n    \"aliases\": {\n        \"packages\": \"../\",\n        \"devpackages\": \"../\"\n    }\n}\n"
+        default.project.json: "{\n  \"name\": \"minimal-shared\",\n  \"tree\": {\n    \"$path\": \"src\"\n  }\n}"
+        src:
+          init.lua: "return \"hey\""
+        wally.toml: "[package]\nname = \"biff/minimal-shared\"\nversion = \"0.1.0\"\nlicense = \"MIT\"\nrealm = \"shared\"\nregistry = \"test-registries/primary-registry\"\n"
     biff_server-depends-on-shared@0.1.0:
       Minimal.luau: "type Package = typeof(require(game.ReplicatedStorage.Packages._Index[\"biff_minimal-shared@0.1.0\"][\"minimal-shared\"]))\nreturn require(game.ReplicatedStorage.Packages._Index[\"biff_minimal-shared@0.1.0\"][\"minimal-shared\"]) :: Package\n"
       server-depends-on-shared:
+        ".luaurc": "{\n    \"aliases\": {\n        \"packages\": \"../\",\n        \"devpackages\": \"../\"\n    }\n}\n"
         default.project.json: "{\n  \"name\": \"server-depends-on-shared\",\n  \"tree\": {\n    \"$path\": \"src\"\n  }\n}"
         src:
           init.lua: "local Minimal = require(script.Parent.Minimal)\n\nreturn function()\n\tprint(Minimal)\nend"
         wally.toml: "[package]\nname = \"biff/server-depends-on-shared\"\nversion = \"0.1.0\"\nlicense = \"MIT\"\nrealm = \"server\"\nregistry = \"test-registries/primary-registry\"\n\n[dependencies]\nMinimal = \"biff/minimal-shared@0.1.0\"\n"
-  sdos.luau: "type Package = typeof(require(\"./_Index/biff_server-depends-on-shared@0.1.0/server-depends-on-shared\"))\nif not game then\n    return require(\"./_Index/biff_server-depends-on-shared@0.1.0/server-depends-on-shared\") :: Package\nelse\n    return require(script.Parent._Index[\"biff_server-depends-on-shared@0.1.0\"][\"server-depends-on-shared\"]) :: Package\nend\n"
+  sdos.luau: "type Package = typeof(require(\"./_Index/biff_server-depends-on-shared@0.1.0/server-depends-on-shared\"))\nreturn require(\"./_Index/biff_server-depends-on-shared@0.1.0/server-depends-on-shared\") :: Package\n"
 default.project.json: "{\n\t\"name\": \"cross-realm-explicit-dependency\",\n\t\"tree\": {\n\t\t\"$path\": \"src\"\n\t}\n}"
 src:
   init.luau: "local Minimal = require(script.Parent.Minimal)\nlocal sdos = require(script.Parent.sdos)\n\nreturn function()\n\tprint(Minimal)\n\tsdos()\nend"

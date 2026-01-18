@@ -81,6 +81,17 @@ impl PackageBuilder {
         self
     }
 
+    pub fn with_dev_dep<A, R>(mut self, alias: A, package_req: R) -> Self
+    where
+        A: Into<String>,
+        R: AsRef<str>,
+    {
+        let req: PackageReq = package_req.as_ref().parse().expect("invalid PackageReq");
+
+        self.manifest.dev_dependencies.insert(alias.into(), req);
+        self
+    }
+
     pub fn with_file<P, C>(mut self, path: P, contents: C) -> Self
     where
         P: Into<String>,

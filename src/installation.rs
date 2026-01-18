@@ -85,7 +85,7 @@ impl InstallationContext {
         root_package_id: PackageId,
         resolved: Resolve,
     ) -> anyhow::Result<()> {
-        let mut handles = Vec::new();
+        let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
         let resolved_copy = resolved.clone();
         let bar = ProgressBar::new((resolved_copy.activated.len() - 1) as u64).with_style(
             ProgressStyle::with_template(
@@ -126,26 +126,30 @@ impl InstallationContext {
                 }
             } else {
                 let metadata = resolved.metadata.get(&package_id).unwrap();
-                let package_realm = metadata.origin_realm;
+                let origin_realms = metadata.origin_realms.clone();
 
-                if let Some(deps) = shared_deps {
-                    self.write_package_links(&package_id, package_realm, deps, &resolved)?;
-                    // Also create top-level links so @packages alias works
-                    self.write_root_package_links(Realm::Shared, deps, &resolved)?;
+                // Write package links for each realm the package needs to be in
+                for &package_realm in &origin_realms {
+                    if let Some(deps) = shared_deps {
+                        self.write_package_links(&package_id, package_realm, deps, &resolved)?;
+                        // Also create top-level links so @packages alias works
+                        self.write_root_package_links(Realm::Shared, deps, &resolved)?;
+                    }
+
+                    if let Some(deps) = server_deps {
+                        self.write_package_links(&package_id, package_realm, deps, &resolved)?;
+                        // Also create top-level links so @packages alias works
+                        self.write_root_package_links(Realm::Server, deps, &resolved)?;
+                    }
+
+                    if let Some(deps) = dev_deps {
+                        self.write_package_links(&package_id, package_realm, deps, &resolved)?;
+                        // Also create top-level links so @packages alias works
+                        self.write_root_package_links(Realm::Dev, deps, &resolved)?;
+                    }
                 }
 
-                if let Some(deps) = server_deps {
-                    self.write_package_links(&package_id, package_realm, deps, &resolved)?;
-                    // Also create top-level links so @packages alias works
-                    self.write_root_package_links(Realm::Server, deps, &resolved)?;
-                }
-
-                if let Some(deps) = dev_deps {
-                    self.write_package_links(&package_id, package_realm, deps, &resolved)?;
-                    // Also create top-level links so @packages alias works
-                    self.write_root_package_links(Realm::Dev, deps, &resolved)?;
-                }
-
+                // Install the package to all realms it's needed in
                 let source_registry = resolved_copy.metadata[&package_id].source_registry.clone();
                 let source_copy = sources.clone();
                 let context = self.clone();
@@ -161,7 +165,11 @@ impl InstallationContext {
                         package_id,
                     ));
                     b.inc(1);
-                    context.write_contents(&package_id, &contents, package_realm)
+                    // Install to all realms where this package is needed
+                    for realm in origin_realms {
+                        context.write_contents(&package_id, &contents, realm)?;
+                    }
+                    Ok(())
                 });
 
                 handles.push(handle);
@@ -288,7 +296,7 @@ impl InstallationContext {
         fs::create_dir_all(base_path)?;
 
         for (dep_name, dep_package_id) in dependencies {
-            let dependencies_realm = resolved.metadata.get(dep_package_id).unwrap().origin_realm;
+            let dependencies_realm = resolved.metadata.get(dep_package_id).unwrap().origin_realm();
             let path = base_path.join(format!("{}.luau", dep_name));
 
             let contents = match (root_realm, dependencies_realm) {
@@ -328,7 +336,7 @@ impl InstallationContext {
         fs::create_dir_all(&base_path)?;
 
         for (dep_name, dep_package_id) in dependencies {
-            let dependencies_realm = resolved.metadata.get(dep_package_id).unwrap().origin_realm;
+            let dependencies_realm = resolved.metadata.get(dep_package_id).unwrap().origin_realm();
             let path = base_path.join(format!("{}.luau", dep_name));
 
             let contents = match (package_realm, dependencies_realm) {
@@ -411,4 +419,155 @@ fn create_package_luaurc(package_path: &Path) -> anyhow::Result<()> {
     log::trace!("Created .luaurc in {}", package_path.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::package_name::PackageName;
+    use semver::Version;
+    use std::str::FromStr;
+    use tempfile::TempDir;
+
+    fn make_package_id(name: &str, version: &str) -> PackageId {
+        let package_name = PackageName::from_str(name).unwrap();
+        let version = Version::parse(version).unwrap();
+        PackageId::new(package_name, version)
+    }
+
+    fn make_context() -> (TempDir, InstallationContext) {
+        let temp_dir = TempDir::new().unwrap();
+        let context = InstallationContext::new(temp_dir.path(), None, None);
+        (temp_dir, context)
+    }
+
+    fn make_context_with_paths(
+        shared_path: Option<&str>,
+        server_path: Option<&str>,
+    ) -> (TempDir, InstallationContext) {
+        let temp_dir = TempDir::new().unwrap();
+        let context = InstallationContext::new(
+            temp_dir.path(),
+            shared_path.map(String::from),
+            server_path.map(String::from),
+        );
+        (temp_dir, context)
+    }
+
+    #[test]
+    fn link_sibling_same_index_generates_correct_path() {
+        let (_temp, context) = make_context();
+        let pkg = make_package_id("biff/test-pkg", "1.2.3");
+
+        let link = context.link_sibling_same_index(&pkg);
+
+        assert!(link.contains("require(\"../biff_test-pkg@1.2.3/test-pkg\")"));
+        assert!(link.contains(":: Package"));
+        // Should NOT contain if/else conditionals
+        assert!(!link.contains("if not game"));
+        assert!(!link.contains("script.Parent"));
+    }
+
+    #[test]
+    fn link_root_same_index_generates_correct_path() {
+        let (_temp, context) = make_context();
+        let pkg = make_package_id("biff/test-pkg", "1.2.3");
+
+        let link = context.link_root_same_index(&pkg);
+
+        assert!(link.contains("require(\"./_Index/biff_test-pkg@1.2.3/test-pkg\")"));
+        assert!(link.contains(":: Package"));
+        // Should NOT contain if/else conditionals
+        assert!(!link.contains("if not game"));
+        assert!(!link.contains("script.Parent"));
+    }
+
+    #[test]
+    fn link_shared_index_without_place_config_uses_relative_path() {
+        let (_temp, context) = make_context();
+        let pkg = make_package_id("biff/test-pkg", "1.2.3");
+
+        let link = context.link_shared_index(&pkg).unwrap();
+
+        assert!(link.contains("require(\"../../../Packages/_Index/biff_test-pkg@1.2.3/test-pkg\")"));
+        assert!(link.contains(":: Package"));
+        // Should NOT contain if/else conditionals or game references
+        assert!(!link.contains("if not game"));
+        assert!(!link.contains("game.ReplicatedStorage"));
+    }
+
+    #[test]
+    fn link_shared_index_with_place_config_uses_roblox_path() {
+        let (_temp, context) =
+            make_context_with_paths(Some("game.ReplicatedStorage.Packages"), None);
+        let pkg = make_package_id("biff/test-pkg", "1.2.3");
+
+        let link = context.link_shared_index(&pkg).unwrap();
+
+        assert!(link.contains("game.ReplicatedStorage.Packages._Index"));
+        assert!(link.contains(":: Package"));
+        // Should use Roblox path, not require-by-string
+        assert!(!link.contains("require(\"../"));
+    }
+
+    #[test]
+    fn link_server_index_without_place_config_uses_relative_path() {
+        let (_temp, context) = make_context();
+        let pkg = make_package_id("biff/test-pkg", "1.2.3");
+
+        let link = context.link_server_index(&pkg).unwrap();
+
+        assert!(
+            link.contains("require(\"../../../ServerPackages/_Index/biff_test-pkg@1.2.3/test-pkg\")")
+        );
+        assert!(link.contains(":: Package"));
+        // Should NOT contain if/else conditionals or game references
+        assert!(!link.contains("if not game"));
+        assert!(!link.contains("game.ServerScriptService"));
+    }
+
+    #[test]
+    fn link_server_index_with_place_config_uses_roblox_path() {
+        let (_temp, context) =
+            make_context_with_paths(None, Some("game.ServerScriptService.Packages"));
+        let pkg = make_package_id("biff/test-pkg", "1.2.3");
+
+        let link = context.link_server_index(&pkg).unwrap();
+
+        assert!(link.contains("game.ServerScriptService.Packages._Index"));
+        assert!(link.contains(":: Package"));
+        // Should use Roblox path, not require-by-string
+        assert!(!link.contains("require(\"../"));
+    }
+
+    #[test]
+    fn package_id_file_name_format() {
+        let pkg = make_package_id("biff/test-pkg", "1.2.3");
+        let file_name = package_id_file_name(&pkg);
+
+        assert_eq!(file_name, "biff_test-pkg@1.2.3");
+    }
+
+    #[test]
+    fn all_links_include_type_annotation() {
+        let (_temp, context) = make_context();
+        let pkg = make_package_id("biff/test-pkg", "1.2.3");
+
+        let sibling = context.link_sibling_same_index(&pkg);
+        let root = context.link_root_same_index(&pkg);
+        let shared = context.link_shared_index(&pkg).unwrap();
+        let server = context.link_server_index(&pkg).unwrap();
+
+        // All links should have type annotations
+        assert!(sibling.contains("type Package = typeof("));
+        assert!(root.contains("type Package = typeof("));
+        assert!(shared.contains("type Package = typeof("));
+        assert!(server.contains("type Package = typeof("));
+
+        // All links should return with type annotation
+        assert!(sibling.contains(":: Package"));
+        assert!(root.contains(":: Package"));
+        assert!(shared.contains(":: Package"));
+        assert!(server.contains(":: Package"));
+    }
 }

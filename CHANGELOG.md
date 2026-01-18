@@ -7,6 +7,11 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.2-horse.4.0 (2026-01-18)
+* Dev dependencies now get their own copies of transitive dependencies in DevPackages
+* Packages needed by both dev and non-dev dependencies are installed in both locations
+* Added unit tests for dev dependency isolation and package link generation
+
 ## 0.3.2-horse.3.0 (2026-01-18)
 * Simplified generated package links to use require-by-string only
 * Removed dual-mode if/else conditionals in favor of relative paths that work in both Lune and Roblox

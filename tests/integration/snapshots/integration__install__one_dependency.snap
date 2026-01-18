@@ -3,10 +3,11 @@ source: tests/integration/install.rs
 expression: result
 ---
 ServerPackages:
-  Minimal.luau: "type Package = typeof(require(\"./_Index/biff_minimal@0.1.0/minimal\"))\nif not game then\n    return require(\"./_Index/biff_minimal@0.1.0/minimal\") :: Package\nelse\n    return require(script.Parent._Index[\"biff_minimal@0.1.0\"][\"minimal\"]) :: Package\nend\n"
+  Minimal.luau: "type Package = typeof(require(\"./_Index/biff_minimal@0.1.0/minimal\"))\nreturn require(\"./_Index/biff_minimal@0.1.0/minimal\") :: Package\n"
   _Index:
     biff_minimal@0.1.0:
       minimal:
+        ".luaurc": "{\n    \"aliases\": {\n        \"packages\": \"../\",\n        \"devpackages\": \"../\"\n    }\n}\n"
         init.lua: "return \"hey\""
 default.project.json: "{\n\t\"name\": \"one-dependency\",\n\t\"tree\": {\n\t\t\"$path\": \"src\"\n\t}\n}"
 src:

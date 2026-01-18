@@ -49,14 +49,30 @@ impl Resolve {
 }
 
 /// A single node in the package resolution graph.
-/// Origin realm is the "most restrictive" realm the package can still be dependended
-/// upon. It is where the package gets placed during install.
-/// See [ origin_realm clarification ]. In the resolve function for more info.
+/// Origin realms tracks all realms where this package needs to be installed.
+/// Dev dependencies get their own copies in DevPackages, separate from shared/server.
 #[derive(Debug, Serialize, Clone)]
 pub struct ResolvePackageMetadata {
     pub realm: Realm,
-    pub origin_realm: Realm,
+    /// All realms where this package needs to be installed.
+    /// A package may need copies in multiple realms if it's a transitive dependency
+    /// of both dev and non-dev dependencies.
+    pub origin_realms: BTreeSet<Realm>,
     pub source_registry: PackageSourceId,
+}
+
+impl ResolvePackageMetadata {
+    /// Returns the primary origin realm for backwards compatibility.
+    /// Prefers Shared > Server > Dev order.
+    pub fn origin_realm(&self) -> Realm {
+        if self.origin_realms.contains(&Realm::Shared) {
+            Realm::Shared
+        } else if self.origin_realms.contains(&Realm::Server) {
+            Realm::Server
+        } else {
+            Realm::Dev
+        }
+    }
 }
 
 pub fn resolve(
@@ -73,7 +89,7 @@ pub fn resolve(
         root_manifest.package_id(),
         ResolvePackageMetadata {
             realm: root_manifest.package.realm,
-            origin_realm: root_manifest.package.realm,
+            origin_realms: BTreeSet::from([root_manifest.package.realm]),
             source_registry: PackageSourceId::DefaultRegistry,
         },
     );
@@ -135,28 +151,18 @@ pub fn resolve(
                     .get_mut(package_id)
                     .expect("activated package was missing metadata");
 
-                // [ origin_realm clarification ]
-                // We want to set the origin to the most restrictive origin possible.
-                // For example we want to keep packages in the dev realm unless a dependency
-                // with a shared/server origin requires it. This way server/shared dependencies
-                // which only originate from dev dependencies get put into the dev folder even
-                // if they usually belong to another realm. Likewise we want to keep shared
-                // dependencies in the server realm unless they are explicitly required as a
-                // shared dependency.
-                let realm_match = match (metadata.origin_realm, dependency_request.origin_realm) {
-                    (_, Realm::Shared) => Realm::Shared,
-                    (Realm::Shared, _) => Realm::Shared,
-                    (_, Realm::Server) => Realm::Server,
-                    (Realm::Server, _) => Realm::Server,
-                    (Realm::Dev, Realm::Dev) => Realm::Dev,
-                };
+                // Add this origin realm to the set of realms where this package
+                // needs to be installed. Dev dependencies get separate copies from
+                // shared/server dependencies.
+                metadata.origin_realms.insert(dependency_request.origin_realm);
 
-                metadata.origin_realm = realm_match;
+                // Use the primary origin realm for the dependency graph
+                let primary_realm = metadata.origin_realm();
 
                 resolve.activate(
                     dependency_request.request_source.clone(),
                     dependency_request.package_alias.clone(),
-                    realm_match,
+                    primary_realm,
                     package_id.clone(),
                 );
 
@@ -243,7 +249,7 @@ pub fn resolve(
                 candidate_id.clone(),
                 ResolvePackageMetadata {
                     realm: candidate.package.realm,
-                    origin_realm: dependency_request.origin_realm,
+                    origin_realms: BTreeSet::from([dependency_request.origin_realm]),
                     source_registry: source_registry.clone(),
                 },
             );
@@ -492,6 +498,90 @@ mod tests {
         let new_resolved = resolve(root.manifest(), &try_to_use, &package_sources)?;
         insta::assert_yaml_snapshot!(new_resolved);
 
+        Ok(())
+    }
+
+    /// Tests that when a shared dependency is needed by both a regular dependency
+    /// and a dev dependency, it gets marked for installation in both realms.
+    #[test]
+    fn dev_dependency_isolation() -> anyhow::Result<()> {
+        let registry = InMemoryRegistry::new();
+        // A shared package that will be used by both regular and dev dependencies
+        registry.publish(PackageBuilder::new("biff/shared-util@1.0.0"));
+        // A regular shared dependency that depends on shared-util
+        registry.publish(
+            PackageBuilder::new("biff/regular-dep@1.0.0")
+                .with_dep("SharedUtil", "biff/shared-util@1.0.0"),
+        );
+        // A dev dependency that also depends on shared-util
+        registry.publish(
+            PackageBuilder::new("biff/dev-dep@1.0.0")
+                .with_dep("SharedUtil", "biff/shared-util@1.0.0"),
+        );
+
+        let root = PackageBuilder::new("biff/root@1.0.0")
+            .with_dep("RegularDep", "biff/regular-dep@1.0.0")
+            .with_dev_dep("DevDep", "biff/dev-dep@1.0.0");
+
+        let package_sources = PackageSourceMap::new(Box::new(registry.source()));
+        let resolved = resolve(root.manifest(), &Default::default(), &package_sources)?;
+
+        // shared-util should have both Shared and Dev in its origin_realms
+        let shared_util_id = resolved
+            .activated
+            .iter()
+            .find(|id| id.name().name() == "shared-util")
+            .expect("shared-util should be activated");
+
+        let metadata = resolved.metadata.get(shared_util_id).unwrap();
+        assert!(
+            metadata.origin_realms.contains(&Realm::Shared),
+            "shared-util should be installed in Shared realm"
+        );
+        assert!(
+            metadata.origin_realms.contains(&Realm::Dev),
+            "shared-util should also be installed in Dev realm"
+        );
+
+        insta::assert_yaml_snapshot!(resolved);
+        Ok(())
+    }
+
+    /// Tests that a pure dev dependency (not also required by regular deps)
+    /// stays in the Dev realm only.
+    #[test]
+    fn pure_dev_dependency_stays_in_dev() -> anyhow::Result<()> {
+        let registry = InMemoryRegistry::new();
+        registry.publish(PackageBuilder::new("biff/test-util@1.0.0"));
+        registry.publish(
+            PackageBuilder::new("biff/dev-dep@1.0.0")
+                .with_dep("TestUtil", "biff/test-util@1.0.0"),
+        );
+
+        let root = PackageBuilder::new("biff/root@1.0.0")
+            .with_dev_dep("DevDep", "biff/dev-dep@1.0.0");
+
+        let package_sources = PackageSourceMap::new(Box::new(registry.source()));
+        let resolved = resolve(root.manifest(), &Default::default(), &package_sources)?;
+
+        // test-util should only be in Dev realm
+        let test_util_id = resolved
+            .activated
+            .iter()
+            .find(|id| id.name().name() == "test-util")
+            .expect("test-util should be activated");
+
+        let metadata = resolved.metadata.get(test_util_id).unwrap();
+        assert!(
+            metadata.origin_realms.contains(&Realm::Dev),
+            "test-util should be in Dev realm"
+        );
+        assert!(
+            !metadata.origin_realms.contains(&Realm::Shared),
+            "test-util should NOT be in Shared realm"
+        );
+
+        insta::assert_yaml_snapshot!(resolved);
         Ok(())
     }
 }
