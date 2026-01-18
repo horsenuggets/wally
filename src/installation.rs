@@ -231,10 +231,11 @@ impl InstallationContext {
             }
             None => {
                 // No Roblox path - generate dual-mode code that works for both Lune and Roblox
+                // Path is ../../../ because shims are at <Dir>/_Index/<package>/file.luau
                 formatdoc! {r#"
                     type Package = typeof(require(game.ReplicatedStorage.Packages._Index["{full_name}"]["{short_name}"]))
                     if not game then
-                        return require("../Packages/_Index/{full_name}/{short_name}") :: Package
+                        return require("../../../Packages/_Index/{full_name}/{short_name}") :: Package
                     else
                         return require(game.ReplicatedStorage.Packages._Index["{full_name}"]["{short_name}"]) :: Package
                     end
@@ -267,10 +268,11 @@ impl InstallationContext {
             }
             None => {
                 // No Roblox path - generate dual-mode code that works for both Lune and Roblox
+                // Path is ../../../ because shims are at <Dir>/_Index/<package>/file.luau
                 formatdoc! {r#"
                     type Package = typeof(require(game.ServerScriptService.Packages._Index["{full_name}"]["{short_name}"]))
                     if not game then
-                        return require("../ServerPackages/_Index/{full_name}/{short_name}") :: Package
+                        return require("../../../ServerPackages/_Index/{full_name}/{short_name}") :: Package
                     else
                         return require(game.ServerScriptService.Packages._Index["{full_name}"]["{short_name}"]) :: Package
                     end
