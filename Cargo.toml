@@ -1,6 +1,6 @@
 [package]
 name = "wally"
-description = "Package manager for Roblox"
+description = "Wally is a modern package manager for Roblox projects inspired by Cargo."
 version = "0.3.2-horse.4.0"
 license = "MPL-2.0"
 authors = ["Lucien Greathouse <lucien@uplift.games>"]
