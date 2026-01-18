@@ -7,6 +7,10 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.2-horse.2.0 (2026-01-18)
+* Made [place] config optional for cross-realm package linking
+* Added dual-mode Luau code generation for Lune and Roblox compatibility
+
 ## 0.3.2-horse.1.0 (2026-01-14)
 * Added type annotations to package links for full Luau typechecking support
 
