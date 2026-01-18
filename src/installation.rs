@@ -186,11 +186,7 @@ impl InstallationContext {
     fn link_sibling_same_index(&self, id: &PackageId) -> String {
         formatdoc! {r#"
             type Package = typeof(require("../{full_name}/{short_name}"))
-            if not game then
-                return require("../{full_name}/{short_name}") :: Package
-            else
-                return require(script.Parent.Parent["{full_name}"]["{short_name}"]) :: Package
-            end
+            return require("../{full_name}/{short_name}") :: Package
             "#,
             full_name = package_id_file_name(id),
             short_name = id.name().name()
@@ -201,11 +197,7 @@ impl InstallationContext {
     fn link_root_same_index(&self, id: &PackageId) -> String {
         formatdoc! {r#"
             type Package = typeof(require("./_Index/{full_name}/{short_name}"))
-            if not game then
-                return require("./_Index/{full_name}/{short_name}") :: Package
-            else
-                return require(script.Parent._Index["{full_name}"]["{short_name}"]) :: Package
-            end
+            return require("./_Index/{full_name}/{short_name}") :: Package
             "#,
             full_name = package_id_file_name(id),
             short_name = id.name().name()
@@ -219,7 +211,7 @@ impl InstallationContext {
 
         let contents = match self.shared_path.as_ref() {
             Some(shared_path) => {
-                // Roblox path provided - use it directly
+                // Roblox path provided - use it directly (legacy support)
                 formatdoc! {r#"
                     type Package = typeof(require({packages}._Index["{full_name}"]["{short_name}"]))
                     return require({packages}._Index["{full_name}"]["{short_name}"]) :: Package
@@ -230,15 +222,11 @@ impl InstallationContext {
                 }
             }
             None => {
-                // No Roblox path - generate dual-mode code that works for both Lune and Roblox
+                // No Roblox path - use require-by-string which works in both Lune and Roblox
                 // Path is ../../../ because shims are at <Dir>/_Index/<package>/file.luau
                 formatdoc! {r#"
-                    type Package = typeof(require(game.ReplicatedStorage.Packages._Index["{full_name}"]["{short_name}"]))
-                    if not game then
-                        return require("../../../Packages/_Index/{full_name}/{short_name}") :: Package
-                    else
-                        return require(game.ReplicatedStorage.Packages._Index["{full_name}"]["{short_name}"]) :: Package
-                    end
+                    type Package = typeof(require("../../../Packages/_Index/{full_name}/{short_name}"))
+                    return require("../../../Packages/_Index/{full_name}/{short_name}") :: Package
                     "#,
                     full_name = full_name,
                     short_name = short_name
@@ -256,7 +244,7 @@ impl InstallationContext {
 
         let contents = match self.server_path.as_ref() {
             Some(server_path) => {
-                // Roblox path provided - use it directly
+                // Roblox path provided - use it directly (legacy support)
                 formatdoc! {r#"
                     type Package = typeof(require({packages}._Index["{full_name}"]["{short_name}"]))
                     return require({packages}._Index["{full_name}"]["{short_name}"]) :: Package
@@ -267,15 +255,11 @@ impl InstallationContext {
                 }
             }
             None => {
-                // No Roblox path - generate dual-mode code that works for both Lune and Roblox
+                // No Roblox path - use require-by-string which works in both Lune and Roblox
                 // Path is ../../../ because shims are at <Dir>/_Index/<package>/file.luau
                 formatdoc! {r#"
-                    type Package = typeof(require(game.ServerScriptService.Packages._Index["{full_name}"]["{short_name}"]))
-                    if not game then
-                        return require("../../../ServerPackages/_Index/{full_name}/{short_name}") :: Package
-                    else
-                        return require(game.ServerScriptService.Packages._Index["{full_name}"]["{short_name}"]) :: Package
-                    end
+                    type Package = typeof(require("../../../ServerPackages/_Index/{full_name}/{short_name}"))
+                    return require("../../../ServerPackages/_Index/{full_name}/{short_name}") :: Package
                     "#,
                     full_name = full_name,
                     short_name = short_name

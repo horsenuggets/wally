@@ -7,6 +7,10 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.2-horse.3.0 (2026-01-18)
+* Simplified generated package links to use require-by-string only
+* Removed dual-mode if/else conditionals in favor of relative paths that work in both Lune and Roblox
+
 ## 0.3.2-horse.2.0 (2026-01-18)
 * Made [place] config optional for cross-realm package linking
 * Added dual-mode Luau code generation for Lune and Roblox compatibility
