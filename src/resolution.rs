@@ -299,15 +299,11 @@ pub fn resolve(
 }
 
 fn compatible(a: &Version, b: &Version) -> bool {
-    if a == b {
-        return true;
-    }
-
-    if a.major == 0 && b.major == 0 {
-        a.minor == b.minor
-    } else {
-        a.major == b.major
-    }
+    // Only consider exact version matches as conflicts.
+    // This allows multiple different versions of the same package to be installed,
+    // enabling proper dependency isolation where each package uses its own
+    // version of shared dependencies.
+    a == b
 }
 
 pub struct DependencyRequest {

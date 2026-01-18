@@ -5,11 +5,11 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, format_err};
+use anyhow::bail;
 use crossterm::style::{Color, SetForegroundColor};
 use fs_err as fs;
 use indicatif::{ProgressBar, ProgressStyle};
-use indoc::{formatdoc, indoc};
+use indoc::formatdoc;
 
 use crate::{
     manifest::Realm,
@@ -214,26 +214,35 @@ impl InstallationContext {
 
     /// Contents of a link into the shared index from outside the shared index.
     fn link_shared_index(&self, id: &PackageId) -> anyhow::Result<String> {
-        let shared_path = self.shared_path.as_ref().ok_or_else(|| {
-            format_err!(indoc! {r#"
-                A server or dev dependency is depending on a shared dependency.
-                To link these packages correctly you must declare where shared
-                packages are placed in the roblox datamodel in your wally.toml.
-                
-                This typically looks like:
+        let full_name = package_id_file_name(id);
+        let short_name = id.name().name();
 
-                [place]
-                shared-packages = "game.ReplicatedStorage.Packages"
-            "#})
-        })?;
-
-        let contents = formatdoc! {r#"
-            type Package = typeof(require({packages}._Index["{full_name}"]["{short_name}"]))
-            return require({packages}._Index["{full_name}"]["{short_name}"]) :: Package
-            "#,
-            packages = shared_path,
-            full_name = package_id_file_name(id),
-            short_name = id.name().name()
+        let contents = match self.shared_path.as_ref() {
+            Some(shared_path) => {
+                // Roblox path provided - use it directly
+                formatdoc! {r#"
+                    type Package = typeof(require({packages}._Index["{full_name}"]["{short_name}"]))
+                    return require({packages}._Index["{full_name}"]["{short_name}"]) :: Package
+                    "#,
+                    packages = shared_path,
+                    full_name = full_name,
+                    short_name = short_name
+                }
+            }
+            None => {
+                // No Roblox path - generate dual-mode code that works for both Lune and Roblox
+                formatdoc! {r#"
+                    type Package = typeof(require(game.ReplicatedStorage.Packages._Index["{full_name}"]["{short_name}"]))
+                    if not game then
+                        return require("../Packages/_Index/{full_name}/{short_name}") :: Package
+                    else
+                        return require(game.ReplicatedStorage.Packages._Index["{full_name}"]["{short_name}"]) :: Package
+                    end
+                    "#,
+                    full_name = full_name,
+                    short_name = short_name
+                }
+            }
         };
 
         Ok(contents)
@@ -241,26 +250,35 @@ impl InstallationContext {
 
     /// Contents of a link into the server index from outside the server index.
     fn link_server_index(&self, id: &PackageId) -> anyhow::Result<String> {
-        let server_path = self.server_path.as_ref().ok_or_else(|| {
-            format_err!(indoc! {r#"
-                A dev dependency is depending on a server dependency.
-                To link these packages correctly you must declare where server
-                packages are placed in the roblox datamodel in your wally.toml.
-                
-                This typically looks like:
+        let full_name = package_id_file_name(id);
+        let short_name = id.name().name();
 
-                [place]
-                server-packages = "game.ServerScriptService.Packages"
-            "#})
-        })?;
-
-        let contents = formatdoc! {r#"
-            type Package = typeof(require({packages}._Index["{full_name}"]["{short_name}"]))
-            return require({packages}._Index["{full_name}"]["{short_name}"]) :: Package
-            "#,
-            packages = server_path,
-            full_name = package_id_file_name(id),
-            short_name = id.name().name()
+        let contents = match self.server_path.as_ref() {
+            Some(server_path) => {
+                // Roblox path provided - use it directly
+                formatdoc! {r#"
+                    type Package = typeof(require({packages}._Index["{full_name}"]["{short_name}"]))
+                    return require({packages}._Index["{full_name}"]["{short_name}"]) :: Package
+                    "#,
+                    packages = server_path,
+                    full_name = full_name,
+                    short_name = short_name
+                }
+            }
+            None => {
+                // No Roblox path - generate dual-mode code that works for both Lune and Roblox
+                formatdoc! {r#"
+                    type Package = typeof(require(game.ServerScriptService.Packages._Index["{full_name}"]["{short_name}"]))
+                    if not game then
+                        return require("../ServerPackages/_Index/{full_name}/{short_name}") :: Package
+                    else
+                        return require(game.ServerScriptService.Packages._Index["{full_name}"]["{short_name}"]) :: Package
+                    end
+                    "#,
+                    full_name = full_name,
+                    short_name = short_name
+                }
+            }
         };
 
         Ok(contents)
@@ -361,6 +379,10 @@ impl InstallationContext {
         fs::create_dir_all(&path)?;
         contents.unpack_into_path(&path)?;
 
+        // Create .luaurc so @packages/@devpackages/@self resolve correctly
+        // for this package's own dependencies
+        create_package_luaurc(&path)?;
+
         Ok(())
     }
 }
@@ -373,4 +395,34 @@ fn package_id_file_name(id: &PackageId) -> String {
         id.name().name(),
         id.version()
     )
+}
+
+/// Creates a .luaurc file inside the package that defines aliases for dependency resolution.
+/// This allows packages to use:
+/// - @packages/... requires which resolve to the package's own dependencies
+/// - @devpackages/... requires which resolve to the package's own dev dependencies
+/// - @self/... requires which resolve to the package's source root
+fn create_package_luaurc(package_path: &Path) -> anyhow::Result<()> {
+    let luaurc_path = package_path.join(".luaurc");
+
+    // Don't overwrite if one already exists
+    if luaurc_path.exists() {
+        return Ok(());
+    }
+
+    // The package source is at _Index/pkgname@version/shortname/
+    // The dependency links are at _Index/pkgname@version/
+    // So we need to go up one level ("../") to reach the dependency folder
+    let luaurc_content = r#"{
+    "aliases": {
+        "packages": "../",
+        "devpackages": "../"
+    }
+}
+"#;
+
+    fs::write(luaurc_path, luaurc_content)?;
+    log::trace!("Created .luaurc in {}", package_path.display());
+
+    Ok(())
 }
