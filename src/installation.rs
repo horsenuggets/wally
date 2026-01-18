@@ -296,15 +296,20 @@ impl InstallationContext {
         fs::create_dir_all(base_path)?;
 
         for (dep_name, dep_package_id) in dependencies {
-            let dependencies_realm = resolved.metadata.get(dep_package_id).unwrap().origin_realm();
+            let dep_metadata = resolved.metadata.get(dep_package_id).unwrap();
             let path = base_path.join(format!("{}.luau", dep_name));
 
-            let contents = match (root_realm, dependencies_realm) {
-                (source, dest) if source == dest => self.link_root_same_index(dep_package_id),
-                (_, Realm::Server) => self.link_server_index(dep_package_id)?,
-                (_, Realm::Shared) => self.link_shared_index(dep_package_id)?,
-                (_, Realm::Dev) => {
-                    bail!("A dev dependency cannot be depended upon by a non-dev dependency")
+            // If the dependency is also installed in the same realm as the root,
+            // use same-index link. Otherwise, use cross-realm link to the primary realm.
+            let contents = if dep_metadata.origin_realms.contains(&root_realm) {
+                self.link_root_same_index(dep_package_id)
+            } else {
+                match dep_metadata.origin_realm() {
+                    Realm::Server => self.link_server_index(dep_package_id)?,
+                    Realm::Shared => self.link_shared_index(dep_package_id)?,
+                    Realm::Dev => {
+                        bail!("A dev dependency cannot be depended upon by a non-dev dependency")
+                    }
                 }
             };
 
@@ -336,15 +341,20 @@ impl InstallationContext {
         fs::create_dir_all(&base_path)?;
 
         for (dep_name, dep_package_id) in dependencies {
-            let dependencies_realm = resolved.metadata.get(dep_package_id).unwrap().origin_realm();
+            let dep_metadata = resolved.metadata.get(dep_package_id).unwrap();
             let path = base_path.join(format!("{}.luau", dep_name));
 
-            let contents = match (package_realm, dependencies_realm) {
-                (source, dest) if source == dest => self.link_sibling_same_index(dep_package_id),
-                (_, Realm::Server) => self.link_server_index(dep_package_id)?,
-                (_, Realm::Shared) => self.link_shared_index(dep_package_id)?,
-                (_, Realm::Dev) => {
-                    bail!("A dev dependency cannot be depended upon by a non-dev dependency")
+            // If the dependency is also installed in the same realm as the package,
+            // use same-index link. Otherwise, use cross-realm link to the primary realm.
+            let contents = if dep_metadata.origin_realms.contains(&package_realm) {
+                self.link_sibling_same_index(dep_package_id)
+            } else {
+                match dep_metadata.origin_realm() {
+                    Realm::Server => self.link_server_index(dep_package_id)?,
+                    Realm::Shared => self.link_shared_index(dep_package_id)?,
+                    Realm::Dev => {
+                        bail!("A dev dependency cannot be depended upon by a non-dev dependency")
+                    }
                 }
             };
 

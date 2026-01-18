@@ -3,7 +3,7 @@ source: tests/integration/install.rs
 expression: result
 ---
 DevPackages:
-  Minimal.luau: "type Package = typeof(require(game.ServerScriptStorage.Packages._Index[\"biff_minimal@0.1.0\"][\"minimal\"]))\nreturn require(game.ServerScriptStorage.Packages._Index[\"biff_minimal@0.1.0\"][\"minimal\"]) :: Package\n"
+  Minimal.luau: "type Package = typeof(require(\"./_Index/biff_minimal@0.1.0/minimal\"))\nreturn require(\"./_Index/biff_minimal@0.1.0/minimal\") :: Package\n"
   _Index:
     biff_minimal@0.1.0:
       minimal:

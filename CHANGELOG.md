@@ -7,6 +7,9 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.2-horse.4.1 (2026-01-18)
+* Fixed package links to use same-index links when dependency is also in the same realm
+
 ## 0.3.2-horse.4.0 (2026-01-18)
 * Dev dependencies now get their own copies of transitive dependencies in DevPackages
 * Packages needed by both dev and non-dev dependencies are installed in both locations

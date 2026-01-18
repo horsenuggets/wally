@@ -22,7 +22,7 @@ ServerPackages:
           init.lua: "return \"hey\""
         wally.toml: "[package]\nname = \"biff/minimal-shared\"\nversion = \"0.1.0\"\nlicense = \"MIT\"\nrealm = \"shared\"\nregistry = \"test-registries/primary-registry\"\n"
     biff_server-depends-on-shared@0.1.0:
-      Minimal.luau: "type Package = typeof(require(game.ReplicatedStorage.Packages._Index[\"biff_minimal-shared@0.1.0\"][\"minimal-shared\"]))\nreturn require(game.ReplicatedStorage.Packages._Index[\"biff_minimal-shared@0.1.0\"][\"minimal-shared\"]) :: Package\n"
+      Minimal.luau: "type Package = typeof(require(\"../biff_minimal-shared@0.1.0/minimal-shared\"))\nreturn require(\"../biff_minimal-shared@0.1.0/minimal-shared\") :: Package\n"
       server-depends-on-shared:
         ".luaurc": "{\n    \"aliases\": {\n        \"packages\": \"../\",\n        \"devpackages\": \"../\"\n    }\n}\n"
         default.project.json: "{\n  \"name\": \"server-depends-on-shared\",\n  \"tree\": {\n    \"$path\": \"src\"\n  }\n}"
