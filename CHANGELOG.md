@@ -7,6 +7,9 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.2-horse.5.0 (2026-03-24)
+* Removed .luaurc generation in installed packages
+
 ## 0.3.2-horse.4.1 (2026-01-18)
 * Fixed package links to use same-index links when dependency is also in the same realm
 
