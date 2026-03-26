@@ -193,8 +193,7 @@ impl InstallationContext {
     /// Contents of a package-to-package link within the same index.
     fn link_sibling_same_index(&self, id: &PackageId) -> String {
         formatdoc! {r#"
-            type Package = typeof(require("../{full_name}/{short_name}"))
-            return require("../{full_name}/{short_name}") :: Package
+            return require("../{full_name}/{short_name}")
             "#,
             full_name = package_id_file_name(id),
             short_name = id.name().name()
@@ -204,8 +203,7 @@ impl InstallationContext {
     /// Contents of a root-to-package link within the same index.
     fn link_root_same_index(&self, id: &PackageId) -> String {
         formatdoc! {r#"
-            type Package = typeof(require("./_Index/{full_name}/{short_name}"))
-            return require("./_Index/{full_name}/{short_name}") :: Package
+            return require("./_Index/{full_name}/{short_name}")
             "#,
             full_name = package_id_file_name(id),
             short_name = id.name().name()
@@ -233,8 +231,7 @@ impl InstallationContext {
                 // No Roblox path - use require-by-string which works in both Lune and Roblox
                 // Path is ../../../ because shims are at <Dir>/_Index/<package>/file.luau
                 formatdoc! {r#"
-                    type Package = typeof(require("../../../Packages/_Index/{full_name}/{short_name}"))
-                    return require("../../../Packages/_Index/{full_name}/{short_name}") :: Package
+                    return require("../../../Packages/_Index/{full_name}/{short_name}")
                     "#,
                     full_name = full_name,
                     short_name = short_name
@@ -266,8 +263,7 @@ impl InstallationContext {
                 // No Roblox path - use require-by-string which works in both Lune and Roblox
                 // Path is ../../../ because shims are at <Dir>/_Index/<package>/file.luau
                 formatdoc! {r#"
-                    type Package = typeof(require("../../../ServerPackages/_Index/{full_name}/{short_name}"))
-                    return require("../../../ServerPackages/_Index/{full_name}/{short_name}") :: Package
+                    return require("../../../ServerPackages/_Index/{full_name}/{short_name}")
                     "#,
                     full_name = full_name,
                     short_name = short_name
@@ -438,7 +434,7 @@ mod tests {
         let link = context.link_sibling_same_index(&pkg);
 
         assert!(link.contains("require(\"../biff_test-pkg@1.2.3/test-pkg\")"));
-        assert!(link.contains(":: Package"));
+        assert!(!link.contains(":: Package"));
         // Should NOT contain if/else conditionals
         assert!(!link.contains("if not game"));
         assert!(!link.contains("script.Parent"));
@@ -452,7 +448,7 @@ mod tests {
         let link = context.link_root_same_index(&pkg);
 
         assert!(link.contains("require(\"./_Index/biff_test-pkg@1.2.3/test-pkg\")"));
-        assert!(link.contains(":: Package"));
+        assert!(!link.contains(":: Package"));
         // Should NOT contain if/else conditionals
         assert!(!link.contains("if not game"));
         assert!(!link.contains("script.Parent"));
@@ -466,7 +462,7 @@ mod tests {
         let link = context.link_shared_index(&pkg).unwrap();
 
         assert!(link.contains("require(\"../../../Packages/_Index/biff_test-pkg@1.2.3/test-pkg\")"));
-        assert!(link.contains(":: Package"));
+        assert!(!link.contains(":: Package"));
         // Should NOT contain if/else conditionals or game references
         assert!(!link.contains("if not game"));
         assert!(!link.contains("game.ReplicatedStorage"));
@@ -496,7 +492,7 @@ mod tests {
         assert!(
             link.contains("require(\"../../../ServerPackages/_Index/biff_test-pkg@1.2.3/test-pkg\")")
         );
-        assert!(link.contains(":: Package"));
+        assert!(!link.contains(":: Package"));
         // Should NOT contain if/else conditionals or game references
         assert!(!link.contains("if not game"));
         assert!(!link.contains("game.ServerScriptService"));
@@ -534,16 +530,14 @@ mod tests {
         let shared = context.link_shared_index(&pkg).unwrap();
         let server = context.link_server_index(&pkg).unwrap();
 
-        // All links should have type annotations
-        assert!(sibling.contains("type Package = typeof("));
-        assert!(root.contains("type Package = typeof("));
-        assert!(shared.contains("type Package = typeof("));
-        assert!(server.contains("type Package = typeof("));
-
-        // All links should return with type annotation
-        assert!(sibling.contains(":: Package"));
-        assert!(root.contains(":: Package"));
-        assert!(shared.contains(":: Package"));
-        assert!(server.contains(":: Package"));
+        // Require-by-string links should be plain returns (no type wrapper)
+        assert!(sibling.contains("return require(\""));
+        assert!(!sibling.contains(":: Package"));
+        assert!(root.contains("return require(\""));
+        assert!(!root.contains(":: Package"));
+        assert!(shared.contains("return require(\""));
+        assert!(!shared.contains(":: Package"));
+        assert!(server.contains("return require(\""));
+        assert!(!server.contains(":: Package"));
     }
 }
