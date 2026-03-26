@@ -61,7 +61,7 @@ serial_test = "2.0.0"
 time = "=0.3.35"
 
 [dev-dependencies]
-insta = { version = "1.1.0" }
+insta = { version = "1.1.0", features = ["yaml"] }
 
 [features]
 vendored-libgit2 = ["git2/vendored-libgit2"]
