@@ -1,7 +1,7 @@
 [package]
 name = "wally"
 description = "Wally is a modern package manager for Roblox projects inspired by Cargo."
-version = "0.3.2-horse.5.0"
+version = "0.3.2-horse.5.1"
 license = "MPL-2.0"
 authors = ["Lucien Greathouse <lucien@uplift.games>"]
 edition = "2018"
@@ -61,7 +61,7 @@ serial_test = "2.0.0"
 time = "=0.3.35"
 
 [dev-dependencies]
-insta = { version = "1.1.0" }
+insta = { version = "1.1.0", features = ["yaml"] }
 
 [features]
 vendored-libgit2 = ["git2/vendored-libgit2"]

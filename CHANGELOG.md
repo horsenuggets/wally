@@ -7,6 +7,10 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## 0.3.2-horse.5.1 (2026-03-26)
+* Simplified require-by-string package links to plain returns for better luau-lsp support
+* Fixed insta test snapshots for yaml feature and version upgrade
+
 ## 0.3.2-horse.5.0 (2026-03-24)
 * Removed .luaurc generation in installed packages
 
