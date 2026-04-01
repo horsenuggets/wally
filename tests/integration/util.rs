@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 #[macro_export]
 macro_rules! assert_dir_snapshot {
-    ( $path:expr ) => {
+    ( $name:expr, $path:expr ) => {
         let result = crate::util::read_path($path).unwrap();
-        insta::assert_yaml_snapshot!(result);
+        insta::assert_yaml_snapshot!($name, result);
     };
 }
 

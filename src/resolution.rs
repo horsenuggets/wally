@@ -154,7 +154,9 @@ pub fn resolve(
                 // Add this origin realm to the set of realms where this package
                 // needs to be installed. Dev dependencies get separate copies from
                 // shared/server dependencies.
-                metadata.origin_realms.insert(dependency_request.origin_realm);
+                metadata
+                    .origin_realms
+                    .insert(dependency_request.origin_realm);
 
                 // Use the primary origin realm for the dependency graph
                 let primary_realm = metadata.origin_realm();
@@ -328,11 +330,15 @@ mod tests {
         package_name::PackageName, package_source::InMemoryRegistry, test_package::PackageBuilder,
     };
 
-    fn test_project(registry: InMemoryRegistry, package: PackageBuilder) -> anyhow::Result<()> {
+    fn test_project(
+        name: &str,
+        registry: InMemoryRegistry,
+        package: PackageBuilder,
+    ) -> anyhow::Result<()> {
         let package_sources = PackageSourceMap::new(Box::new(registry.source()));
         let manifest = package.into_manifest();
         let resolve = resolve(&manifest, &Default::default(), &package_sources)?;
-        insta::assert_yaml_snapshot!(resolve);
+        insta::assert_yaml_snapshot!(name, resolve);
         Ok(())
     }
 
@@ -341,7 +347,7 @@ mod tests {
         let registry = InMemoryRegistry::new();
 
         let root = PackageBuilder::new("biff/minimal@0.1.0");
-        test_project(registry, root)
+        test_project("minimal", registry, root)
     }
 
     #[test]
@@ -352,7 +358,7 @@ mod tests {
 
         let root = PackageBuilder::new("biff/one-dependency@0.1.0")
             .with_dep("Minimal", "biff/minimal@0.1.0");
-        test_project(registry, root)
+        test_project("one_dependency", registry, root)
     }
 
     #[test]
@@ -366,7 +372,7 @@ mod tests {
 
         let root = PackageBuilder::new("biff/transitive-dependency@0.1.0")
             .with_dep("OneDependency", "biff/one-dependency@0.1.0");
-        test_project(registry, root)
+        test_project("transitive_dependency", registry, root)
     }
 
     /// When there are shared dependencies, Wally should select the same
@@ -382,7 +388,7 @@ mod tests {
             .with_dep("B", "biff/b@1.0.0")
             .with_dep("C", "biff/c@1.0.0");
 
-        test_project(registry, root)
+        test_project("unified_dependencies", registry, root)
     }
 
     /// Server dependencies are allowed to depend on shared dependencies. If a
@@ -401,7 +407,7 @@ mod tests {
         let root =
             PackageBuilder::new("biff/root@1.0.0").with_server_dep("Server", "biff/server@1.0.0");
 
-        test_project(registry, root)
+        test_project("server_to_shared", registry, root)
     }
 
     /// but... if that shared dependency is required by another shared dependency,
@@ -420,7 +426,7 @@ mod tests {
             .with_server_dep("Server", "biff/server@1.0.0")
             .with_dep("Shared", "biff/shared@1.0.0");
 
-        test_project(registry, root)
+        test_project("server_to_shared_and_shared_to_shared", registry, root)
     }
 
     /// Shared dependencies are allowed to depend on server dependencies. Server
@@ -433,7 +439,7 @@ mod tests {
         let root =
             PackageBuilder::new("biff/root@1.0.0").with_server_dep("Server", "biff/server@1.0.0");
 
-        test_project(registry, root)
+        test_project("shared_to_server", registry, root)
     }
 
     #[test]
@@ -554,12 +560,11 @@ mod tests {
         let registry = InMemoryRegistry::new();
         registry.publish(PackageBuilder::new("biff/test-util@1.0.0"));
         registry.publish(
-            PackageBuilder::new("biff/dev-dep@1.0.0")
-                .with_dep("TestUtil", "biff/test-util@1.0.0"),
+            PackageBuilder::new("biff/dev-dep@1.0.0").with_dep("TestUtil", "biff/test-util@1.0.0"),
         );
 
-        let root = PackageBuilder::new("biff/root@1.0.0")
-            .with_dev_dep("DevDep", "biff/dev-dep@1.0.0");
+        let root =
+            PackageBuilder::new("biff/root@1.0.0").with_dev_dep("DevDep", "biff/dev-dep@1.0.0");
 
         let package_sources = PackageSourceMap::new(Box::new(registry.source()));
         let resolved = resolve(root.manifest(), &Default::default(), &package_sources)?;
