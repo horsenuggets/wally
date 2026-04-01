@@ -1,0 +1,3 @@
+[submodule "Submodules/luau-cicd"]
+	path = submodules/luau-cicd
+	url = git@github.com:horsenuggets/luau-cicd.git
