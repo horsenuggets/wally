@@ -489,9 +489,8 @@ mod tests {
 
         let link = context.link_server_index(&pkg).unwrap();
 
-        assert!(
-            link.contains("require(\"../../../ServerPackages/_Index/biff_test-pkg@1.2.3/test-pkg\")")
-        );
+        assert!(link
+            .contains("require(\"../../../ServerPackages/_Index/biff_test-pkg@1.2.3/test-pkg\")"));
         assert!(!link.contains(":: Package"));
         // Should NOT contain if/else conditionals or game references
         assert!(!link.contains("if not game"));

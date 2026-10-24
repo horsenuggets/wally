@@ -98,6 +98,6 @@ fn run_install_test(name: &str) -> TempProject {
 
     args.run().unwrap();
 
-    assert_dir_snapshot!(project.path());
+    assert_dir_snapshot!(name, project.path());
     project
 }

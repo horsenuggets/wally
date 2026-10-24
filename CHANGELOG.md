@@ -7,43 +7,43 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
-## 0.3.2-horse.5.1 (2026-03-26)
+## `0.3.2-horse.5.1`
 * Simplified require-by-string package links to plain returns for better luau-lsp support
 * Fixed insta test snapshots for yaml feature and version upgrade
 
-## 0.3.2-horse.5.0 (2026-03-24)
+## `0.3.2-horse.5.0`
 * Removed .luaurc generation in installed packages
 
-## 0.3.2-horse.4.1 (2026-01-18)
+## `0.3.2-horse.4.1`
 * Fixed package links to use same-index links when dependency is also in the same realm
 
-## 0.3.2-horse.4.0 (2026-01-18)
+## `0.3.2-horse.4.0`
 * Dev dependencies now get their own copies of transitive dependencies in DevPackages
 * Packages needed by both dev and non-dev dependencies are installed in both locations
 * Added unit tests for dev dependency isolation and package link generation
 
-## 0.3.2-horse.3.0 (2026-01-18)
+## `0.3.2-horse.3.0`
 * Simplified generated package links to use require-by-string only
 * Removed dual-mode if/else conditionals in favor of relative paths that work in both Lune and Roblox
 
-## 0.3.2-horse.2.0 (2026-01-18)
+## `0.3.2-horse.2.0`
 * Made [place] config optional for cross-realm package linking
 * Added dual-mode Luau code generation for Lune and Roblox compatibility
 
-## 0.3.2-horse.1.0 (2026-01-14)
+## `0.3.2-horse.1.0`
 * Added type annotations to package links for full Luau typechecking support
 
-## 0.3.2-horse.0.3 (2026-01-14)
+## `0.3.2-horse.0.3`
 * Changed generated link files from .lua to .luau extension
 * Fixed @packages alias for transitive dependencies by creating top-level links for all packages
 
-## 0.3.2-horse.0.2 (2025-11-27)
+## `0.3.2-horse.0.2`
 * Updated package links with split behavior
 
-## 0.3.2-horse.0.1 (2025-11-27)
+## `0.3.2-horse.0.1`
 * Changed package links to use require-by-string
 
-## 0.3.2 (2023-06-05)
+## `0.3.2`
 * Added private field to package manifest ([#9])([#76])
 * Improved lockfile generation **lockfiles will change** ([#130])
 * Improved package installation to download packages in parallel ([#133])
@@ -74,14 +74,14 @@
 [#133]: https://github.com/UpliftGames/wally/pull/133
 [#121]: https://github.com/UpliftGames/wally/pull/121
 
-## 0.3.1 (2021-11-12)
+## `0.3.1`
 * Support for dev dependencies ([#63][63])
 * Clarified upgrade response for outdated cli clients
 * Clarified feedback on failure to resolve package
 
 [#63]: https://github.com/UpliftGames/wally/pull/63
 
-## 0.3.0 (2021-11-11)
+## `0.3.0`
 * Fixed Windows generating invalid zip archives. ([#15][#15])
 * Support for registry fallback chains ([#35][#35])
 * Generate cross realm package links ([#38][#38])
@@ -100,12 +100,12 @@
 [#55]: https://github.com/UpliftGames/wally/pull/55
 [#57]: https://github.com/UpliftGames/wally/pull/57
 
-## 0.2.1 (2021-10-01)
+## `0.2.1`
 * First iteration of wally frontend. ([#32][#32])
 
 [#32]: https://github.com/UpliftGames/wally/pull/32
 
-## 0.2.0 (2021-09-29)
+## `0.2.0`
 * Fixed package links between sibling packages. ([#17][#17])
 * Fixed invalid package names being generated from `wally init`. ([#19][#19])
 * Added public authentication strategy via GitHub. ([#20][#20])
@@ -122,10 +122,10 @@
 [#27]: https://github.com/UpliftGames/wally/pull/27
 [#28]: https://github.com/UpliftGames/wally/pull/28
 
-## 0.1.1 (2021-08-03)
+## `0.1.1`
 * Fixed `wally install` failing due to a "file not found" error. ([#11][#11])
 
 [#11]: https://github.com/UpliftGames/wally/pull/11
 
-## 0.1.0 (2021-08-03)
+## `0.1.0`
 * Initial release
