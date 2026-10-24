@@ -109,10 +109,9 @@ jobs:
         run: ./scripts/unpack-releases.sh "./releases"
 
       - name: Write changelog to file
-        run: |
-          cat << 'EOF' > /tmp/changelog.txt
-          ${{ needs.init.outputs.changelog }}
-          EOF
+        env:
+          CHANGELOG: ${{ needs.init.outputs.changelog }}
+        run: printf '%s\n' "$CHANGELOG" > /tmp/changelog.txt
 
       - name: Create release
         env:
