@@ -2,6 +2,7 @@ name: Release checks
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
     branches:
       - release
 
@@ -82,7 +83,7 @@ jobs:
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
 
-          if ! grep -q "## \`$VERSION\`" CHANGELOG.md; then
+          if ! grep -qxF "## \`$VERSION\`" CHANGELOG.md; then
             echo "::error::CHANGELOG.md does not have an entry for version $VERSION"
             echo "Expected to find: ## \`$VERSION\`"
             exit 1
@@ -146,6 +147,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.cargo-target }}
+
+      - name: Link OpenSSL statically
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.cargo-target }}

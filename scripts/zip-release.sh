@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 BIN_NAME="wally"
 BIN_EXT=""
 CWD="$PWD"
 
-TARGET_TRIPLE="$1"
+TARGET_TRIPLE="${1:-}"
 if [ -z "$TARGET_TRIPLE" ]; then
-    echo "Usage: $0 <TARGET_TRIPLE>"
+    echo "[Usage] $0 <TARGET_TRIPLE>"
     exit 1
 fi
 TARGET_DIR="target/$TARGET_TRIPLE/release"

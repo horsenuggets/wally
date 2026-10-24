@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 CWD="$PWD"
 
-RELEASES_DIR="$1"
+RELEASES_DIR="${1:-}"
 if [ -z "$RELEASES_DIR" ]; then
-    echo "Usage: $0 <RELEASES_DIR>"
+    echo "[Usage] $0 <RELEASES_DIR>"
     exit 1
 fi
 if [ ! -d "$RELEASES_DIR" ]; then

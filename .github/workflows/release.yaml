@@ -28,7 +28,7 @@ jobs:
         id: get_version
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
-          echo "value=${VERSION}" >> $GITHUB_OUTPUT
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Extract changelog for this version
         id: get_changelog
@@ -43,10 +43,13 @@ jobs:
             found { print }
           ' CHANGELOG.md | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sed '/^$/N;/^\n$/d')
 
-          echo "$CHANGELOG" > /tmp/changelog.txt
-          echo "value<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGELOG" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # Use a random delimiter so no line of the changelog can end the output early.
+          DELIMITER="CHANGELOG_$(openssl rand -hex 16)"
+          {
+            echo "value<<$DELIMITER"
+            echo "$CHANGELOG"
+            echo "$DELIMITER"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: ["init"]
@@ -79,6 +82,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.cargo-target }}
+
+      - name: Link OpenSSL statically
+        if: runner.os != 'Windows'
+        run: echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
 
       - name: Build binary
         run: cargo build --release --locked --target ${{ matrix.cargo-target }}
@@ -118,6 +125,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "v${{ needs.init.outputs.version }}" \
+            --target "$GITHUB_SHA" \
             --title "${{ needs.init.outputs.version }}" \
             --notes-file /tmp/changelog.txt \
             ./releases/*.zip
