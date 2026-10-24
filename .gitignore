@@ -9,3 +9,7 @@
 .local
 .vscode
 /TODO.md
+
+# Worktrees
+/.worktrees/
+/.wt/
