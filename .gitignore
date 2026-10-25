@@ -10,6 +10,11 @@
 .vscode
 /TODO.md
 
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+
 # Worktrees
 /.worktrees/
 /.wt/
