@@ -4,6 +4,12 @@ root = true
 indent_style = space
 indent_size = 2
 
+[*.{tf,tfvars,tftest.hcl,tfmock.hcl,tfquery.hcl}]
+end_of_line = lf
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+
 [*.{yml,yaml}]
 indent_style = space
 indent_size = 2
