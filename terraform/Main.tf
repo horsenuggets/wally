@@ -4,7 +4,7 @@ terraform {
 
     required_providers {
         github = {
-            source  = "integrations/github"
+            source = "integrations/github"
             version = "~> 6.0"
         }
     }
@@ -15,7 +15,7 @@ provider "github" {
 }
 
 module "repo" {
-    source     = "../submodules/luau-cicd/Terraform/Modules/LuauRepo"
+    source = "../submodules/luau-cicd/Terraform/Modules/LuauRepo"
     repository = "wally"
 
     # Upstream sync PRs land with a merge commit to keep upstream history on main.
@@ -25,7 +25,7 @@ module "repo" {
         "Build",
         "Clippy",
         "Format",
-        "Test",
+        "Test"
     ]
 
     release_checks = [
@@ -34,6 +34,6 @@ module "repo" {
         "Build test - Windows",
         "Validate PR title",
         "Validate version",
-        "Verify diff matches main",
+        "Verify diff matches main"
     ]
 }
