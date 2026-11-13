@@ -25,7 +25,7 @@ module "repo" {
         "Build",
         "Clippy",
         "Format",
-        "Test",
+        "Test"
     ]
 
     release_checks = [
@@ -34,6 +34,6 @@ module "repo" {
         "Build test - Windows",
         "Validate PR title",
         "Validate version",
-        "Verify diff matches main",
+        "Verify diff matches main"
     ]
 }
