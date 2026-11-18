@@ -363,7 +363,11 @@ fn sync_tree(root: &Path) -> anyhow::Result<()> {
     for entry in WalkDir::new(root).contents_first(true) {
         let entry = entry?;
         if entry.file_type().is_file() {
-            File::open(entry.path())?.sync_all()?;
+            OpenOptions::new()
+                .read(true)
+                .write(cfg!(windows))
+                .open(entry.path())?
+                .sync_all()?;
         } else {
             sync_dir(entry.path())?;
         }
@@ -407,6 +411,21 @@ mod tests {
         )
         .unwrap();
         journal
+    }
+
+    #[test]
+    fn sync_tree_flushes_staged_files_without_truncating_contents() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        fs_err::create_dir_all(root.join("Packages/nested/empty")).unwrap();
+        let path = root.join("Packages/nested/init.luau");
+        let contents = b"return { Value = 42 }\n";
+        fs_err::write(&path, contents).unwrap();
+
+        sync_tree(root).unwrap();
+
+        assert_eq!(fs_err::read(&path).unwrap(), contents);
+        assert!(root.join("Packages/nested/empty").is_dir());
     }
 
     #[test]
