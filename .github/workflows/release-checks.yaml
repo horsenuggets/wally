@@ -155,3 +155,7 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.cargo-target }}
+
+      - name: Test installation on Windows
+        if: runner.os == 'Windows'
+        run: cargo test --release --locked --target ${{ matrix.cargo-target }}

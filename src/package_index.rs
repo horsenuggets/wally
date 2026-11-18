@@ -120,6 +120,7 @@ impl PackageIndex {
     /// servers; it's intended for use with local registries or in the
     /// implementation of the registry server itself.
     pub fn publish(&self, manifest: &Manifest) -> anyhow::Result<()> {
+        manifest.validate_publish()?;
         let repo = self.repository.lock().unwrap();
         let package_path = self.package_path(&manifest.package.name);
 

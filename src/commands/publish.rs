@@ -27,6 +27,7 @@ pub struct PublishSubcommand {
 impl PublishSubcommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
         let manifest = Manifest::load(&self.project_path)?;
+        manifest.validate_publish()?;
 
         if manifest.package.private {
             bail!("Cannot publish private package.");

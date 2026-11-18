@@ -81,9 +81,12 @@ impl PackageSourceProvider for InMemoryRegistrySource {
         let result = entries
             .iter()
             .filter(|entry| {
-                package_req
-                    .version_req()
-                    .matches(&entry.manifest.package.version)
+                entry
+                    .manifest
+                    .package
+                    .version
+                    .as_ref()
+                    .map_or(false, |version| package_req.version_req().matches(version))
             })
             .map(|entry| &entry.manifest)
             .cloned()
@@ -104,7 +107,7 @@ impl PackageSourceProvider for InMemoryRegistrySource {
 
         let entry = manifests
             .iter()
-            .find(|entry| &entry.manifest.package.version == package_id.version())
+            .find(|entry| entry.manifest.package.version.as_ref() == package_id.version())
             .ok_or_else(|| format_err!("Package {} does not exist", package_id))?;
 
         Ok(entry.contents.clone())

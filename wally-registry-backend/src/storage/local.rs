@@ -53,7 +53,11 @@ fn package_path(package_directory: Option<&Path>, id: &PackageId) -> anyhow::Res
     let base_path = package_directory.unwrap_or_else(|| Path::new("packages"));
     let mut path = base_path.join(id.name().scope());
     path.push(id.name().name());
-    path.push(format!("{}.zip", id.version()));
+    path.push(format!(
+        "{}.zip",
+        id.version()
+            .context("Registry storage requires a versioned package identity.")?
+    ));
 
     anyhow::ensure!(
         path.starts_with(base_path),

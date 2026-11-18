@@ -1,5 +1,10 @@
 # Cargo build output
-/target
+/target/
+
+# Generated Wally installation state
+.wally-install/
+.wally-install.lock
+wally.install.json
 
 # Insta uncommitted snapshots
 *.snap.new
