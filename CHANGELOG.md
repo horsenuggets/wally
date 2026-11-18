@@ -7,6 +7,16 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## `0.3.2-horse.6.0`
+* Added versionless local dependencies with caret-prefixed workspace paths in every realm.
+* Added source-aware lock metadata and install provenance for authoritative local sources.
+* Made staged installs recoverable and guarded source paths against traversal and overlap.
+* Forwarded named Luau types, generic defaults, and type packs through generated links.
+* Scoped installed package aliases to their shared, server, or development realm.
+* Rejected local dependencies and versionless packages at registry publication boundaries.
+* Isolated integration fixtures and preserved the pinned registry backend dependency commit
+  through its current public repository URL.
+
 ## `0.3.2-horse.5.1`
 * Simplified require-by-string package links to plain returns for better luau-lsp support
 * Fixed insta test snapshots for yaml feature and version upgrade
