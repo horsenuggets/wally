@@ -219,8 +219,29 @@ fn get_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> anyhow::Result<M
         .context("could not read manifest file")?;
 
     let manifest = Manifest::from_slice(&manifest_contents)?;
+    manifest.validate_publish()?;
 
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod local_manifest_tests {
+    use super::*;
+    use libwally::test_package::PackageBuilder;
+
+    #[test]
+    fn registry_rejects_versionless_and_local_dependency_archives() {
+        for package in [
+            PackageBuilder::new("fixture/local@local:Source/local"),
+            PackageBuilder::new("fixture/package@1.0.0").with_dep("Local", "^Source/local"),
+            PackageBuilder::new("fixture/package@1.0.0").with_server_dep("Local", "^Source/local"),
+            PackageBuilder::new("fixture/package@1.0.0").with_dev_dep("Local", "^Source/local"),
+        ] {
+            let contents = package.contents();
+            let mut archive = ZipArchive::new(Cursor::new(contents.data())).unwrap();
+            assert!(get_manifest(&mut archive).is_err());
+        }
+    }
 }
 
 pub fn server(figment: Figment) -> rocket::Rocket<Build> {

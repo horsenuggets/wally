@@ -33,7 +33,11 @@ pub(crate) fn generate_dependency_changes(
         let total_new_matches = new_matches.clone().count();
 
         // If there's more than one new or old matches, then we do the simple route of listing the exact versions removed/added.
-        if total_new_matches > 1 || total_old_matches > 1 {
+        if total_new_matches > 1
+            || total_old_matches > 1
+            || old_matches.clone().any(|id| id.local_path().is_some())
+            || new_matches.clone().any(|id| id.local_path().is_some())
+        {
             dependency
                 .extend(old_matches.map(|package| DependencyChange::Removed(package.clone())));
             dependency.extend(new_matches.map(|package| DependencyChange::Added(package.clone())));
@@ -62,6 +66,13 @@ pub(crate) fn generate_dependency_changes(
     dependency
 }
 
+fn version_description(id: &PackageId) -> String {
+    match id.version() {
+        Some(version) => format!("v{}", version),
+        None => format!("local ({})", id.local_path().unwrap()),
+    }
+}
+
 pub(crate) fn render_update_difference(
     dependency_changes: &[DependencyChange],
     writer: &mut impl Write,
@@ -88,37 +99,37 @@ pub(crate) fn render_update_difference(
         match dependency_change {
             DependencyChange::Added(package_id) => writeln!(
                 writer,
-                "{}      Added {}{} v{}",
+                "{}      Added {}{} {}",
                 SetForegroundColor(Color::DarkGreen),
                 SetForegroundColor(Color::Reset),
                 package_id.name(),
-                package_id.version()
+                version_description(package_id)
             ),
             DependencyChange::Removed(package_id) => writeln!(
                 writer,
-                "{}    Removed {}{} v{}",
+                "{}    Removed {}{} {}",
                 SetForegroundColor(Color::DarkRed),
                 SetForegroundColor(Color::Reset),
                 package_id.name(),
-                package_id.version()
+                version_description(package_id)
             ),
             DependencyChange::Upgraded { from, to } => writeln!(
                 writer,
-                "{}    Updated {}{} from v{} to v{}",
+                "{}    Updated {}{} from {} to {}",
                 SetForegroundColor(Color::DarkCyan),
                 SetForegroundColor(Color::Reset),
                 from.name(),
-                from.version(),
-                to.version()
+                version_description(from),
+                version_description(to)
             ),
             DependencyChange::Downgraded { from, to } => writeln!(
                 writer,
-                "{} Downgraded {}{} from v{} to v{}",
+                "{} Downgraded {}{} from {} to {}",
                 SetForegroundColor(Color::DarkYellow),
                 SetForegroundColor(Color::Reset),
                 from.name(),
-                from.version(),
-                to.version()
+                version_description(from),
+                version_description(to)
             ),
         }?
     }
@@ -177,6 +188,20 @@ mod test {
                     }
             })
         };
+    }
+
+    #[test]
+    fn local_source_changes_are_not_semver_upgrades() {
+        let old = BTreeSet::from([package_id!("fixture/foo@local:Source/old")]);
+        let new = BTreeSet::from([package_id!("fixture/foo@local:Source/new")]);
+        let changes = generate_dependency_changes(&old, &new);
+        assert!(removed_change!(changes, "fixture/foo@local:Source/old"));
+        assert!(added_change!(changes, "fixture/foo@local:Source/new"));
+        let mut output = Vec::new();
+        render_update_difference(&changes, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("local (Source/new)"));
+        assert!(!output.contains("vlocal"));
     }
 
     #[test]

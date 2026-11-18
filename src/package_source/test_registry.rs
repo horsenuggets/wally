@@ -53,7 +53,9 @@ impl PackageSourceProvider for TestRegistry {
                 .into_iter::<Manifest>()
                 .filter(|manifest| {
                     if let Ok(manifest) = manifest {
-                        package_req.matches(&manifest.package.name, &manifest.package.version)
+                        manifest.package.version.as_ref().map_or(false, |version| {
+                            package_req.matches(&manifest.package.name, version)
+                        })
                     } else {
                         true
                     }
@@ -75,7 +77,12 @@ impl PackageSourceProvider for TestRegistry {
         package_path.push("contents");
         package_path.push(package_id.name().scope());
         package_path.push(package_id.name().name());
-        package_path.push(format!("{}.zip", package_id.version()));
+        package_path.push(format!(
+            "{}.zip",
+            package_id
+                .version()
+                .context("Cannot download local identity from a registry.")?
+        ));
 
         let data = fs_err::read(&package_path)?;
         Ok(PackageContents::from_buffer(data))
@@ -89,9 +96,13 @@ impl PackageSourceProvider for TestRegistry {
         let sources = config
             .fallback_registries
             .iter()
-            .map(|source| self.path.join(source).canonicalize().unwrap())
-            .map(PackageSourceId::Path)
-            .collect();
+            .map(|source| {
+                self.path
+                    .join(source)
+                    .canonicalize()
+                    .map(PackageSourceId::Path)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(sources)
     }

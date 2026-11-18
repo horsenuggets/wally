@@ -11,7 +11,7 @@ use crate::{
     manifest::{Manifest, Package, Realm},
     package_contents::PackageContents,
     package_id::PackageId,
-    package_req::PackageReq,
+    package_req::DependencyReq,
 };
 
 pub struct PackageBuilder {
@@ -28,6 +28,7 @@ impl PackageBuilder {
         let (name, version) = id.into_parts();
 
         let manifest = Manifest {
+            content_hash: None,
             package: Package {
                 name,
                 version,
@@ -64,7 +65,7 @@ impl PackageBuilder {
         A: Into<String>,
         R: AsRef<str>,
     {
-        let req: PackageReq = package_req.as_ref().parse().expect("invalid PackageReq");
+        let req: DependencyReq = package_req.as_ref().parse().expect("invalid DependencyReq");
 
         self.manifest.dependencies.insert(alias.into(), req);
         self
@@ -75,7 +76,7 @@ impl PackageBuilder {
         A: Into<String>,
         R: AsRef<str>,
     {
-        let req: PackageReq = package_req.as_ref().parse().expect("invalid PackageReq");
+        let req: DependencyReq = package_req.as_ref().parse().expect("invalid DependencyReq");
 
         self.manifest.server_dependencies.insert(alias.into(), req);
         self
@@ -86,7 +87,7 @@ impl PackageBuilder {
         A: Into<String>,
         R: AsRef<str>,
     {
-        let req: PackageReq = package_req.as_ref().parse().expect("invalid PackageReq");
+        let req: DependencyReq = package_req.as_ref().parse().expect("invalid DependencyReq");
 
         self.manifest.dev_dependencies.insert(alias.into(), req);
         self

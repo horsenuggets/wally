@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::package_id::PackageId;
 use crate::package_name::PackageName;
-use crate::package_req::PackageReq;
+use crate::package_req::DependencyReq;
 
 pub const MANIFEST_FILE_NAME: &str = "wally.toml";
 
@@ -15,19 +15,21 @@ pub const MANIFEST_FILE_NAME: &str = "wally.toml";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Manifest {
+    #[serde(skip)]
+    pub content_hash: Option<String>,
     pub package: Package,
 
     #[serde(default)]
     pub place: PlaceInfo,
 
     #[serde(default)]
-    pub dependencies: BTreeMap<String, PackageReq>,
+    pub dependencies: BTreeMap<String, DependencyReq>,
 
     #[serde(default)]
-    pub server_dependencies: BTreeMap<String, PackageReq>,
+    pub server_dependencies: BTreeMap<String, DependencyReq>,
 
     #[serde(default)]
-    pub dev_dependencies: BTreeMap<String, PackageReq>,
+    pub dev_dependencies: BTreeMap<String, DependencyReq>,
 }
 
 impl Manifest {
@@ -36,21 +38,36 @@ impl Manifest {
         let file_path = dir.join(MANIFEST_FILE_NAME);
 
         let content = fs_err::read_to_string(&file_path)?;
-        let manifest: Manifest = toml::from_str(&content)
+        let mut manifest: Manifest = toml::from_str(&content)
             .with_context(|| format!("failed to parse manifest at path {}", file_path.display()))?;
-
+        manifest.content_hash = Some(crate::local_packages::hash_bytes(content.as_bytes()));
         Ok(manifest)
     }
 
     pub fn from_slice(slice: &[u8]) -> anyhow::Result<Self> {
-        let manifest: Manifest =
-            toml::from_slice(slice).with_context(|| format!("failed to parse manifest"))?;
-
+        let mut manifest: Manifest = toml::from_slice(slice).context("failed to parse manifest")?;
+        manifest.content_hash = Some(crate::local_packages::hash_bytes(slice));
         Ok(manifest)
     }
 
     pub fn package_id(&self) -> PackageId {
-        PackageId::new(self.package.name.clone(), self.package.version.clone())
+        match &self.package.version {
+            Some(version) => PackageId::new(self.package.name.clone(), version.clone()),
+            None => PackageId::local(self.package.name.clone(), ".".into()),
+        }
+    }
+
+    pub fn validate_publish(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.package.version.is_some(),
+            "Registry publication requires a package version."
+        );
+        anyhow::ensure!(
+            self.dependencies.values().chain(self.server_dependencies.values()).chain(self.dev_dependencies.values())
+                .all(|req| matches!(req, DependencyReq::Registry(_))),
+            "Cannot publish local dependencies. Replace caret paths with published registry requirements first."
+        );
+        Ok(())
     }
 }
 
@@ -64,11 +81,13 @@ pub struct Package {
     /// The current version of the package.
     ///
     /// Example: `1.0.0`
-    pub version: Version,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<Version>,
 
     /// The registry that this package should pull its dependencies from.
     ///
     /// Example: `https://github.com/UpliftGames/wally-test-index`
+    #[serde(default)]
     pub registry: String,
 
     /// The realms (`shared`, `server`, etc) that this package can be used in.
@@ -176,6 +195,15 @@ pub enum Realm {
 }
 
 impl Realm {
+    /// Development copies stay isolated; server edges never acquire a shared origin.
+    pub fn dependency_origin(origin: Self, edge: Self) -> Self {
+        match (origin, edge) {
+            (Self::Dev, _) | (_, Self::Dev) => Self::Dev,
+            (_, Self::Server) => Self::Server,
+            _ => origin,
+        }
+    }
+
     pub fn is_dependency_valid(dep_type: Self, dep_realm: Self) -> bool {
         use Realm::*;
 

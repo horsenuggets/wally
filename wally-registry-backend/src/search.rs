@@ -107,9 +107,11 @@ impl SearchBackend {
             let mut doc = Document::default();
 
             for manifest in &(*metadata).versions {
-                doc.add_text(versions, manifest.package.version.to_string());
+                manifest.validate_publish()?;
+                let version = manifest.package.version.as_ref().unwrap();
+                doc.add_text(versions, version.to_string());
 
-                if !manifest.package.version.is_prerelease() {
+                if !version.is_prerelease() {
                     doc.add_text(scope, manifest.package.name.scope());
                     doc.add_text(name, manifest.package.name.name());
 

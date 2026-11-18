@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,7 +10,6 @@ use structopt::StructOpt;
 use crate::installation::InstallationContext;
 use crate::lockfile::Lockfile;
 use crate::manifest::Manifest;
-use crate::package_id::PackageId;
 use crate::package_source::{PackageSource, PackageSourceMap, Registry, TestRegistry};
 use crate::resolution::resolve;
 
@@ -33,12 +30,12 @@ pub struct InstallSubcommand {
 
 impl InstallSubcommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
-        let manifest = Manifest::load(&self.project_path)?;
+        let root = self.project_path.canonicalize()?;
+        let manifest = Manifest::load(&root)?;
 
-        let lockfile = Lockfile::load(&self.project_path)?
-            .unwrap_or_else(|| Lockfile::from_manifest(&manifest));
-
-        let default_registry: Box<PackageSource> = if global.test_registry {
+        let default_registry: Box<PackageSource> = if manifest.package.registry.is_empty() {
+            Box::new(crate::package_source::InMemoryRegistry::new().source())
+        } else if global.test_registry {
             Box::new(PackageSource::TestRegistry(TestRegistry::new(
                 &manifest.package.registry,
             )))
@@ -48,8 +45,11 @@ impl InstallSubcommand {
             )?))
         };
 
-        let mut package_sources = PackageSourceMap::new(default_registry);
-        package_sources.add_fallbacks()?;
+        let mut package_sources =
+            PackageSourceMap::new(default_registry).with_project_root(&root)?;
+        package_sources.prepare(&manifest)?;
+        let transaction = crate::install_transaction::InstallTransaction::begin(&root)?;
+        let lockfile = Lockfile::load(&root)?.unwrap_or_else(|| Lockfile::from_manifest(&manifest));
 
         let try_to_use = lockfile.as_ids().collect();
 
@@ -59,6 +59,7 @@ impl InstallSubcommand {
 
         progress.enable_steady_tick(Duration::from_millis(100));
 
+        let resolved = resolve(&manifest, &try_to_use, &package_sources)?;
         if self.locked {
             progress.println(format!(
                 "{} Verifying {}lockfile is up-to-date...",
@@ -66,9 +67,8 @@ impl InstallSubcommand {
                 SetForegroundColor(Color::Reset)
             ));
 
-            let latest_graph = resolve(&manifest, &BTreeSet::new(), &package_sources)?;
-
-            if try_to_use != latest_graph.activated {
+            let latest_graph = resolve(&manifest, &Default::default(), &package_sources)?;
+            if !lockfile.graph_matches(&latest_graph) {
                 progress.finish_and_clear();
 
                 let old_dependencies = &try_to_use;
@@ -113,8 +113,6 @@ impl InstallSubcommand {
             SetForegroundColor(Color::Reset)
         ));
 
-        let resolved = resolve(&manifest, &try_to_use, &package_sources)?;
-
         progress.println(format!(
             "{}   Resolved {}{} dependencies",
             SetForegroundColor(Color::DarkGreen),
@@ -122,36 +120,14 @@ impl InstallSubcommand {
             resolved.activated.len() - 1
         ));
 
-        let new_lockfile = Lockfile::from_resolve(&resolved);
-        new_lockfile.save(&self.project_path)?;
-
-        progress.println(format!(
-            "{}  Generated {}lockfile",
-            SetForegroundColor(Color::DarkGreen),
-            SetForegroundColor(Color::Reset)
-        ));
-
-        progress.set_message(format!(
-            "{}  Cleaning {}package destination...",
-            SetForegroundColor(Color::DarkGreen),
-            SetForegroundColor(Color::Reset)
-        ));
-        let root_package_id = PackageId::new(manifest.package.name, manifest.package.version);
-        let installation = InstallationContext::new(
-            &self.project_path,
-            manifest.place.shared_packages,
-            manifest.place.server_packages,
-        );
-
-        installation.clean()?;
-        progress.println(format!(
-            "{}    Cleaned {}package destination",
-            SetForegroundColor(Color::DarkGreen),
-            SetForegroundColor(Color::Reset)
-        ));
         progress.finish_and_clear();
-
-        installation.install(package_sources, root_package_id, resolved)?;
+        InstallationContext::install_atomic(
+            &root,
+            package_sources,
+            &manifest,
+            resolved,
+            transaction,
+        )?;
 
         Ok(())
     }

@@ -8,8 +8,9 @@ use serde::ser::{Serialize, Serializer};
 
 use crate::package_name::PackageName;
 
-/// Refers to a specific version of a package. Package IDs consist of a scope,
-/// name, and SemVer version.
+/// Identifies either a registry package by name and SemVer version, or a local
+/// package by name and normalized consuming-project-relative source directory.
+/// Local identities have no version and never satisfy registry requirements.
 ///
 /// All rules for package names apply to the first portion of a package ID.
 ///
@@ -19,30 +20,65 @@ use crate::package_name::PackageName;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PackageId {
     name: PackageName,
-    version: Version,
+    source: PackageIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PackageIdentity {
+    Registry(Version),
+    Local(String),
 }
 
 impl PackageId {
     pub fn new(name: PackageName, version: Version) -> Self {
-        Self { name, version }
+        Self {
+            name,
+            source: PackageIdentity::Registry(version),
+        }
+    }
+
+    pub fn local(name: PackageName, path: String) -> Self {
+        Self {
+            name,
+            source: PackageIdentity::Local(path),
+        }
+    }
+
+    pub fn local_path(&self) -> Option<&str> {
+        match &self.source {
+            PackageIdentity::Local(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    pub fn index_version(&self) -> String {
+        self.version()
+            .map_or_else(|| "local".into(), ToString::to_string)
     }
 
     pub fn name(&self) -> &PackageName {
         &self.name
     }
 
-    pub fn version(&self) -> &Version {
-        &self.version
+    pub fn version(&self) -> Option<&Version> {
+        match &self.source {
+            PackageIdentity::Registry(version) => Some(version),
+            _ => None,
+        }
     }
 
-    pub fn into_parts(self) -> (PackageName, Version) {
-        (self.name, self.version)
+    pub fn into_parts(self) -> (PackageName, Option<Version>) {
+        let version = self.version().cloned();
+        (self.name, version)
     }
 }
 
 impl fmt::Display for PackageId {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        write!(formatter, "{}@{}", self.name, self.version)
+        match &self.source {
+            PackageIdentity::Registry(version) => write!(formatter, "{}@{}", self.name, version),
+            PackageIdentity::Local(path) => write!(formatter, "{}@local:{}", self.name, path),
+        }
     }
 }
 
@@ -58,25 +94,25 @@ impl FromStr for PackageId {
 
         let mut second_half = name_and_version.splitn(2, '@');
         let name = second_half.next().ok_or_else(|| anyhow!(BAD_FORMAT_MSG))?;
-        let version = second_half
-            .next()
-            .ok_or_else(|| anyhow!(BAD_FORMAT_MSG))?
-            .parse()
-            .context("could not parse version")?;
-
+        let source = second_half.next().ok_or_else(|| anyhow!(BAD_FORMAT_MSG))?;
         let package_name = PackageName::new(scope, name).context(BAD_FORMAT_MSG)?;
-        Ok(PackageId::new(package_name, version))
+        if let Some(path) = source.strip_prefix("local:") {
+            if path != "." {
+                crate::package_req::validate_local_path(path)?;
+            }
+            Ok(PackageId::local(package_name, path.into()))
+        } else {
+            Ok(PackageId::new(
+                package_name,
+                source.parse().context("could not parse version")?,
+            ))
+        }
     }
 }
 
 impl Serialize for PackageId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let combined_name = format!(
-            "{}/{}@{}",
-            self.name().scope(),
-            self.name().name(),
-            self.version()
-        );
+        let combined_name = self.to_string();
         serializer.serialize_str(&combined_name)
     }
 }
@@ -113,7 +149,7 @@ mod test {
         );
         assert_eq!(id.name().scope(), "foo");
         assert_eq!(id.name().name(), "bar");
-        assert_eq!(id.version(), &Version::new(1, 2, 3));
+        assert_eq!(id.version(), Some(&Version::new(1, 2, 3)));
     }
 
     #[test]
@@ -130,7 +166,7 @@ mod test {
         let hello: PackageId = "hello/world@1.2.3".parse().unwrap();
         assert_eq!(hello.name().scope(), "hello");
         assert_eq!(hello.name().name(), "world");
-        assert_eq!(hello.version(), &Version::new(1, 2, 3));
+        assert_eq!(hello.version(), Some(&Version::new(1, 2, 3)));
     }
 
     #[test]

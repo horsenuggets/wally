@@ -70,7 +70,9 @@ impl PackageSourceProvider for Registry {
             .versions
             .iter()
             .filter(|manifest| {
-                package_req.matches(&manifest.package.name, &manifest.package.version)
+                manifest.package.version.as_ref().map_or(false, |version| {
+                    package_req.matches(&manifest.package.name, version)
+                })
             })
             .cloned()
             .collect();
@@ -83,7 +85,9 @@ impl PackageSourceProvider for Registry {
             "/v1/package-contents/{}/{}/{}",
             package_id.name().scope(),
             package_id.name().name(),
-            package_id.version()
+            package_id.version().ok_or_else(|| anyhow::anyhow!(
+                "Cannot download local identity from a registry."
+            ))?
         );
 
         let url = self.api_url()?.join(&path)?;

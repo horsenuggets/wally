@@ -36,7 +36,9 @@ impl PackageReq {
     }
 
     pub fn matches_id(&self, package_id: &PackageId) -> bool {
-        self.matches(package_id.name(), package_id.version())
+        package_id
+            .version()
+            .map_or(false, |version| self.matches(package_id.name(), version))
     }
 
     pub fn matches(&self, name: &PackageName, version: &Version) -> bool {
@@ -115,6 +117,88 @@ impl<'de> Visitor<'de> for PackageReqVisitor {
 
     fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
         value.parse().map_err(|err| E::custom(err))
+    }
+}
+
+/// A registry requirement or a versionless, consuming-project-relative directory.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DependencyReq {
+    Registry(PackageReq),
+    Local(String),
+}
+
+pub(crate) fn is_reserved_path_component(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || (stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+}
+
+/// Require one portable, normalized spelling for local paths on every platform.
+pub fn validate_local_path(path: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !path.is_empty()
+            && path.split('/').all(|part| {
+                !part.is_empty()
+                    && part != "."
+                    && part != ".."
+                    && !is_reserved_path_component(part)
+                    && !part.chars().any(|c| {
+                        c.is_control()
+                            || matches!(c, '\\' | ':' | '"' | '<' | '>' | '|' | '?' | '*')
+                    })
+                    && !part.ends_with('.')
+                    && !part.ends_with(' ')
+            }),
+        "Local package paths must be normalized project-relative directories without traversal."
+    );
+    Ok(())
+}
+
+impl From<PackageReq> for DependencyReq {
+    fn from(req: PackageReq) -> Self {
+        Self::Registry(req)
+    }
+}
+
+impl FromStr for DependencyReq {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        if let Some(path) = value.strip_prefix('^') {
+            validate_local_path(path)?;
+            Ok(Self::Local(path.to_owned()))
+        } else {
+            Ok(Self::Registry(value.parse()?))
+        }
+    }
+}
+
+impl fmt::Display for DependencyReq {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Registry(req) => req.fmt(formatter),
+            Self::Local(path) => write!(formatter, "^{}", path),
+        }
+    }
+}
+
+impl Serialize for DependencyReq {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for DependencyReq {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(D::Error::custom)
     }
 }
 

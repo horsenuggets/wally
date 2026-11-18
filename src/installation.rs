@@ -1,6 +1,6 @@
 use std::{
+    collections::BTreeMap,
     fmt::Display,
-    io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -29,6 +29,7 @@ pub struct InstallationContext {
     server_path: Option<String>,
     dev_dir: PathBuf,
     dev_index_dir: PathBuf,
+    type_exports: BTreeMap<PackageId, crate::link_types::ForwardedTypes>,
 }
 
 impl InstallationContext {
@@ -55,32 +56,65 @@ impl InstallationContext {
             server_path,
             dev_dir,
             dev_index_dir,
+            type_exports: BTreeMap::new(),
         }
-    }
-
-    /// Delete the existing index, if it exists.
-    pub fn clean(&self) -> anyhow::Result<()> {
-        fn remove_ignore_not_found(path: &Path) -> io::Result<()> {
-            if let Err(err) = fs::remove_dir_all(path) {
-                if err.kind() != io::ErrorKind::NotFound {
-                    return Err(err);
-                }
-            }
-
-            Ok(())
-        }
-
-        remove_ignore_not_found(&self.shared_dir)?;
-        remove_ignore_not_found(&self.server_dir)?;
-        remove_ignore_not_found(&self.dev_dir)?;
-
-        Ok(())
     }
 
     /// Install all packages from the given `Resolve` into the package that this
     /// `InstallationContext` was built for.
-    pub fn install(
-        self,
+    pub(crate) fn install_atomic(
+        project_path: &Path,
+        sources: PackageSourceMap,
+        manifest: &crate::manifest::Manifest,
+        resolved: Resolve,
+        transaction: crate::install_transaction::InstallTransaction,
+    ) -> anyhow::Result<()> {
+        let root = project_path.canonicalize()?;
+        let root_id = manifest.package_id();
+        let mut metadata =
+            crate::local_packages::InstallMetadata::derive(&root, &resolved, &root_id)?;
+        let stage = transaction.stage();
+        let context = Self::new(
+            &stage,
+            manifest.place.shared_packages.clone(),
+            manifest.place.server_packages.clone(),
+        );
+        context.install(sources, root_id, resolved.clone())?;
+        for dir in crate::local_packages::DESTINATIONS {
+            let base = stage.join(dir);
+            if !base.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&base) {
+                let entry = entry?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let relative = entry
+                    .path()
+                    .strip_prefix(&stage)?
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("Non-Unicode generated path."))?
+                    .replace('\\', "/");
+                if !metadata
+                    .package_roots
+                    .iter()
+                    .any(|package| relative.starts_with(&format!("{}/", package.install_path)))
+                {
+                    metadata.generated_paths.push(relative);
+                }
+            }
+        }
+        metadata.generated_paths.sort();
+        let lockfile = crate::lockfile::Lockfile::from_resolve(&resolved);
+        lockfile.save(&stage)?;
+        metadata.save(&stage)?;
+        metadata.verify_manifests(&root)?;
+        transaction.commit()
+    }
+
+    fn install(
+        mut self,
         sources: PackageSourceMap,
         root_package_id: PackageId,
         resolved: Resolve,
@@ -106,48 +140,10 @@ impl InstallationContext {
         for package_id in resolved_copy.activated {
             log::debug!("Installing {}...", package_id);
 
-            let shared_deps = resolved.shared_dependencies.get(&package_id);
-            let server_deps = resolved.server_dependencies.get(&package_id);
-            let dev_deps = resolved.dev_dependencies.get(&package_id);
-
-            // We do not need to install the root package, but we should create
-            // package links for its dependencies.
-            if package_id == root_package_id {
-                if let Some(deps) = shared_deps {
-                    self.write_root_package_links(Realm::Shared, deps, &resolved)?;
-                }
-
-                if let Some(deps) = server_deps {
-                    self.write_root_package_links(Realm::Server, deps, &resolved)?;
-                }
-
-                if let Some(deps) = dev_deps {
-                    self.write_root_package_links(Realm::Dev, deps, &resolved)?;
-                }
-            } else {
+            // The root itself is not copied into its generated package directories.
+            if package_id != root_package_id {
                 let metadata = resolved.metadata.get(&package_id).unwrap();
-                let origin_realms = metadata.origin_realms.clone();
-
-                // Write package links for each realm the package needs to be in
-                for &package_realm in &origin_realms {
-                    if let Some(deps) = shared_deps {
-                        self.write_package_links(&package_id, package_realm, deps, &resolved)?;
-                        // Also create top-level links so @packages alias works
-                        self.write_root_package_links(Realm::Shared, deps, &resolved)?;
-                    }
-
-                    if let Some(deps) = server_deps {
-                        self.write_package_links(&package_id, package_realm, deps, &resolved)?;
-                        // Also create top-level links so @packages alias works
-                        self.write_root_package_links(Realm::Server, deps, &resolved)?;
-                    }
-
-                    if let Some(deps) = dev_deps {
-                        self.write_package_links(&package_id, package_realm, deps, &resolved)?;
-                        // Also create top-level links so @packages alias works
-                        self.write_root_package_links(Realm::Dev, deps, &resolved)?;
-                    }
-                }
+                let origin_realms = metadata.installation_realms(&package_id);
 
                 // Install the package to all realms it's needed in
                 let source_registry = resolved_copy.metadata[&package_id].source_registry.clone();
@@ -156,8 +152,16 @@ impl InstallationContext {
                 let b = bar.clone();
 
                 let handle = runtime.spawn_blocking(move || {
-                    let package_source = source_copy.get(&source_registry).unwrap();
-                    let contents = package_source.download_package(&package_id)?;
+                    let contents = if let Some(path) = package_id.local_path() {
+                        let source = crate::local_packages::source_directory(
+                            source_copy.project_root()?,
+                            path,
+                        )?;
+                        PackageContents::pack_from_path(&source)?
+                    } else {
+                        let package_source = source_copy.get(&source_registry).unwrap();
+                        package_source.download_package(&package_id)?
+                    };
                     b.println(format!(
                         "{} Downloaded {}{}",
                         SetForegroundColor(Color::DarkGreen),
@@ -184,9 +188,111 @@ impl InstallationContext {
                 .expect("Package failed to be installed.")?;
         }
 
+        // All entrypoints must be read from the fully unpacked staging tree. In
+        // particular, local include/exclude rules and registry archives are authoritative.
+        for id in &resolved.activated {
+            if id == &root_package_id {
+                continue;
+            }
+            let realms = resolved.metadata[id].installation_realms(id);
+            let index = match realms.iter().next().expect("Installed package has a realm") {
+                Realm::Shared => &self.shared_index_dir,
+                Realm::Server => &self.server_index_dir,
+                Realm::Dev => &self.dev_index_dir,
+            };
+            let root = index.join(package_id_file_name(id)).join(id.name().name());
+            self.type_exports
+                .insert(id.clone(), crate::link_types::exports(&root)?);
+        }
+        self.write_all_root_package_links(&root_package_id, &resolved)?;
+        for id in &resolved.activated {
+            if id == &root_package_id {
+                continue;
+            }
+            for realm in resolved.metadata[id].installation_realms(id) {
+                for graph in [
+                    &resolved.shared_dependencies,
+                    &resolved.server_dependencies,
+                    &resolved.dev_dependencies,
+                ] {
+                    if let Some(dependencies) = graph.get(id) {
+                        self.write_package_links(id, realm, dependencies, &resolved)?;
+                    }
+                }
+            }
+        }
+
+        // Package dependencies use the installed realm's namespace, not the consuming
+        // project's shared alias. The configuration belongs to the generated surface.
+        let mut aliases = serde_json::to_vec_pretty(&serde_json::json!({
+            "aliases": { "packages": "./" }
+        }))?;
+        aliases.push(b'\n');
+        for directory in [&self.shared_dir, &self.server_dir, &self.dev_dir] {
+            if directory.is_dir() {
+                fs::write(directory.join(".luaurc"), &aliases)?;
+            }
+        }
+
         bar.finish_and_clear();
         log::info!("Downloaded {} packages!", num_packages);
 
+        Ok(())
+    }
+
+    /// Preserve unambiguous transitive root aliases for @packages consumers, without
+    /// allowing a transitive alias to overwrite a declared root dependency or leak a
+    /// server/dev package into the shared realm. Ambiguous aliases remain package-local.
+    fn write_all_root_package_links(
+        &self,
+        root: &PackageId,
+        resolved: &Resolve,
+    ) -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+        let graphs = [
+            (Realm::Shared, &resolved.shared_dependencies),
+            (Realm::Server, &resolved.server_dependencies),
+            (Realm::Dev, &resolved.dev_dependencies),
+        ];
+        let mut roots: BTreeMap<Realm, BTreeMap<String, PackageId>> = BTreeMap::new();
+        let mut candidates: BTreeMap<(Realm, String), Option<(String, PackageId)>> =
+            BTreeMap::new();
+        for (edge_realm, graph) in graphs {
+            if let Some(direct) = graph.get(root) {
+                roots.insert(edge_realm, direct.clone());
+            }
+            for (source, dependencies) in graph {
+                if source == root {
+                    continue;
+                }
+                for &origin in &resolved.metadata[source].origin_realms {
+                    let realm = Realm::dependency_origin(origin, edge_realm);
+                    for (alias, id) in dependencies {
+                        let value = (alias.clone(), id.clone());
+                        let entry = candidates
+                            .entry((realm, alias.to_ascii_lowercase()))
+                            .or_insert_with(|| Some(value.clone()));
+                        if entry.as_ref() != Some(&value) {
+                            *entry = None;
+                        }
+                    }
+                }
+            }
+        }
+        for ((realm, folded), value) in candidates {
+            if let Some((alias, id)) = value {
+                let aliases = roots.entry(realm).or_default();
+                if !aliases
+                    .keys()
+                    .any(|alias| alias.to_ascii_lowercase() == folded)
+                {
+                    aliases.insert(alias, id);
+                }
+            }
+        }
+        for (realm, dependencies) in roots {
+            self.write_root_package_links(realm, &dependencies, resolved)?;
+        }
         Ok(())
     }
 
@@ -274,6 +380,28 @@ impl InstallationContext {
         Ok(contents)
     }
 
+    fn link_root_cross_index(&self, id: &PackageId, realm: Realm) -> anyhow::Result<String> {
+        let configured = match realm {
+            Realm::Shared => self.shared_path.is_some(),
+            Realm::Server => self.server_path.is_some(),
+            Realm::Dev => bail!("A dev dependency cannot be linked from another realm"),
+        };
+        if configured {
+            return match realm {
+                Realm::Shared => self.link_shared_index(id),
+                Realm::Server => self.link_server_index(id),
+                Realm::Dev => unreachable!(),
+            };
+        }
+        Ok(formatdoc! {r#"
+            return require("../{directory}/_Index/{full_name}/{short_name}")
+            "#,
+            directory = crate::local_packages::realm_directory(realm),
+            full_name = package_id_file_name(id),
+            short_name = id.name().name()
+        })
+    }
+
     fn write_root_package_links<'a, K: Display>(
         &self,
         root_realm: Realm,
@@ -297,12 +425,15 @@ impl InstallationContext {
 
             // If the dependency is also installed in the same realm as the root,
             // use same-index link. Otherwise, use cross-realm link to the primary realm.
-            let contents = if dep_metadata.origin_realms.contains(&root_realm) {
+            let contents = if dep_metadata
+                .installation_realms(dep_package_id)
+                .contains(&root_realm)
+            {
                 self.link_root_same_index(dep_package_id)
             } else {
                 match dep_metadata.origin_realm() {
-                    Realm::Server => self.link_server_index(dep_package_id)?,
-                    Realm::Shared => self.link_shared_index(dep_package_id)?,
+                    Realm::Server => self.link_root_cross_index(dep_package_id, Realm::Server)?,
+                    Realm::Shared => self.link_root_cross_index(dep_package_id, Realm::Shared)?,
                     Realm::Dev => {
                         bail!("A dev dependency cannot be depended upon by a non-dev dependency")
                     }
@@ -310,6 +441,7 @@ impl InstallationContext {
             };
 
             log::trace!("Writing {}", path.display());
+            let contents = crate::link_types::forward(contents, &self.type_exports[dep_package_id]);
             fs::write(path, contents)?;
         }
 
@@ -342,7 +474,10 @@ impl InstallationContext {
 
             // If the dependency is also installed in the same realm as the package,
             // use same-index link. Otherwise, use cross-realm link to the primary realm.
-            let contents = if dep_metadata.origin_realms.contains(&package_realm) {
+            let contents = if dep_metadata
+                .installation_realms(dep_package_id)
+                .contains(&package_realm)
+            {
                 self.link_sibling_same_index(dep_package_id)
             } else {
                 match dep_metadata.origin_realm() {
@@ -355,6 +490,7 @@ impl InstallationContext {
             };
 
             log::trace!("Writing {}", path.display());
+            let contents = crate::link_types::forward(contents, &self.type_exports[dep_package_id]);
             fs::write(path, contents)?;
         }
 
@@ -384,12 +520,12 @@ impl InstallationContext {
 }
 
 /// Creates a suitable name for use in file paths that refer to this package.
-fn package_id_file_name(id: &PackageId) -> String {
+pub fn package_id_file_name(id: &PackageId) -> String {
     format!(
         "{}_{}@{}",
         id.name().scope(),
         id.name().name(),
-        id.version()
+        id.index_version()
     )
 }
 
