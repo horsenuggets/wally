@@ -187,13 +187,9 @@ pub fn resolve(
                 // Add this origin realm to the set of realms where this package
                 // needs to be installed. Dev dependencies get separate copies from
                 // shared/server dependencies.
-                anyhow::ensure!(
-                    Realm::is_dependency_valid(dependency_request.request_realm, metadata.realm),
-                    "Invalid {:?} dependency edge to {} ({:?}).",
-                    dependency_request.request_realm,
-                    package_id,
-                    metadata.realm
-                );
+                if !Realm::is_dependency_valid(dependency_request.request_realm, metadata.realm) {
+                    continue;
+                }
                 let added = metadata
                     .origin_realms
                     .insert(dependency_request.origin_realm);
@@ -587,6 +583,46 @@ mod tests {
             PackageBuilder::new("biff/root@1.0.0").with_server_dep("Server", "biff/server@1.0.0");
 
         test_project("shared_to_server", registry, root)
+    }
+
+    #[test]
+    fn incompatible_activated_realms_do_not_hide_valid_registry_versions() {
+        for preactivate_shared in [false, true] {
+            let registry = InMemoryRegistry::new();
+            registry.publish(PackageBuilder::new("biff/util@1.0.0"));
+            registry.publish(PackageBuilder::new("biff/util@2.0.0").with_realm(Realm::Server));
+            registry.publish(
+                PackageBuilder::new("biff/bridge@1.0.0").with_dep("Util", "biff/util@>=1.0.0"),
+            );
+            let mut root = PackageBuilder::new("biff/root@1.0.0")
+                .with_dep("Bridge", "biff/bridge@1.0.0")
+                .with_server_dep("ServerUtil", "biff/util@=2.0.0");
+            if preactivate_shared {
+                root = root.with_dep("ActivatedShared", "biff/util@=1.0.0");
+            }
+            let sources = PackageSourceMap::new(Box::new(registry.source()));
+
+            let resolved = resolve(root.manifest(), &BTreeSet::new(), &sources).unwrap();
+
+            let shared: PackageId = "biff/util@1.0.0".parse().unwrap();
+            let server: PackageId = "biff/util@2.0.0".parse().unwrap();
+            let bridge: PackageId = "biff/bridge@1.0.0".parse().unwrap();
+            assert_eq!(resolved.shared_dependencies[&bridge]["Util"], shared);
+            assert_eq!(
+                resolved.server_dependencies[&root.manifest().package_id()]["ServerUtil"],
+                server
+            );
+            assert_eq!(
+                resolved.metadata[&shared].origin_realms,
+                BTreeSet::from([Realm::Shared])
+            );
+            assert_eq!(
+                resolved.metadata[&server].origin_realms,
+                BTreeSet::from([Realm::Server])
+            );
+            assert!(resolved.activated.contains(&shared));
+            assert!(resolved.activated.contains(&server));
+        }
     }
 
     #[test]

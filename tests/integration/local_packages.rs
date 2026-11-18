@@ -596,10 +596,15 @@ fn reused_active_server_node_is_rejected_on_a_shared_edge() {
         "[dependencies]\nServer='^Forks/server'",
     );
     local(project.path(), "Forks/server", "server", "server", "");
-    assert!(install(project.path(), false)
-        .unwrap_err()
-        .to_string()
-        .contains("Invalid Shared dependency edge"));
+    let error = install(project.path(), false).unwrap_err().to_string();
+    assert!(
+        error.contains("No packages were found that matched (Shared)"),
+        "{}",
+        error
+    );
+    assert!(error.contains("^Forks/server"), "{}", error);
+    assert!(!project.path().join("wally.lock").exists());
+    assert!(!project.path().join("wally.install.json").exists());
 }
 
 #[test]
@@ -943,6 +948,238 @@ fn ambiguous_transitive_root_aliases_stay_isolated_in_package_shims() {
             .unwrap()
             .contains("fixture_y@local/y")
     );
+}
+
+#[test]
+fn installed_packages_resolve_private_aliases_in_their_own_index_buckets() {
+    fn alias_directory(source: &Path) -> std::path::PathBuf {
+        for directory in source.parent().unwrap().ancestors() {
+            let config = directory.join(".luaurc");
+            if config.is_file() {
+                let config: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+                if let Some(alias) = config["aliases"]["packages"].as_str() {
+                    return directory.join(alias).canonicalize().unwrap();
+                }
+            }
+        }
+        panic!("No packages alias found for {}", source.display());
+    }
+
+    fn source_bytes(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                (
+                    entry.path().strip_prefix(root).unwrap().to_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    for registry_source in [false, true] {
+        for (section, realm) in [
+            ("dependencies", "Packages"),
+            ("server-dependencies", "ServerPackages"),
+            ("dev-dependencies", "DevPackages"),
+        ] {
+            for root_util in [false, true] {
+                let project = TempProject::empty().unwrap();
+                let root = project.path();
+                let requirement = |name: &str| {
+                    if registry_source {
+                        format!("fixture/{name}@1")
+                    } else {
+                        format!("^Forks/{name}")
+                    }
+                };
+                for (name, dependency) in [
+                    ("a", Some("x")),
+                    ("b", Some("y")),
+                    ("x", None),
+                    ("y", None),
+                    ("z", None),
+                ] {
+                    let source = if dependency.is_some() {
+                        "return require(\"@packages/Util\")\n".to_owned()
+                    } else {
+                        format!("return {{ Identity = \"{name}\" }}\n")
+                    };
+                    if registry_source {
+                        let mut package = PackageBuilder::new(format!("fixture/{name}@1.0.0"))
+                            .with_file("init.luau", "return require(\"@self/Source/Module\")\n")
+                            .with_file(
+                                "default.project.json",
+                                r#"{"tree":{"$path":"Source/Module"}}"#,
+                            )
+                            .with_file("Source/Module/init.luau", source);
+                        if let Some(dependency) = dependency {
+                            package = package.with_dep("Util", requirement(dependency));
+                        }
+                        write(
+                            root,
+                            &format!("Registry/index/fixture/{name}"),
+                            format!("{}\n", serde_json::to_string(package.manifest()).unwrap()),
+                        );
+                        write(
+                            root,
+                            &format!("Registry/contents/fixture/{name}/1.0.0.zip"),
+                            package.contents().data(),
+                        );
+                    } else {
+                        let deps = dependency
+                            .map(|name| format!("[dependencies]\nUtil='{}'", requirement(name)))
+                            .unwrap_or_default();
+                        local(root, &format!("Forks/{name}"), name, "shared", &deps);
+                        write(
+                            root,
+                            &format!("Forks/{name}/Source/Module/init.luau"),
+                            source,
+                        );
+                    }
+                }
+                let registry = if registry_source {
+                    write(
+                        root,
+                        "Registry/index/config.json",
+                        r#"{"api":"https://example.invalid/","fallback_registries":[]}"#,
+                    );
+                    format!(
+                        "registry={}\n",
+                        toml::Value::String(root.join("Registry").to_str().unwrap().into())
+                    )
+                } else {
+                    String::new()
+                };
+                // Give x a shared installation too, exercising cross-index local shims
+                // and multiple registry installations when the consumers are server/dev.
+                let shared = format!("[dependencies]\nSharedTarget='{}'\n", requirement("x"));
+                let direct = format!(
+                    "A='{}'\nB='{}'\n{}",
+                    requirement("a"),
+                    requirement("b"),
+                    if root_util {
+                        format!("Util='{}'\n", requirement("z"))
+                    } else {
+                        String::new()
+                    }
+                );
+                let deps = if section == "dependencies" {
+                    format!("{shared}{direct}")
+                } else {
+                    format!("{shared}[{section}]\n{direct}")
+                };
+                write(
+                    root,
+                    "wally.toml",
+                    format!("[package]\nname='fixture/root'\nrealm='shared'\n{registry}{deps}"),
+                );
+                let source_root = root.join(if registry_source { "Registry" } else { "Forks" });
+                let before = source_bytes(&source_root);
+                install(root, false).unwrap();
+                assert_eq!(source_bytes(&source_root), before);
+                let info = metadata(root);
+
+                for package in &info.package_roots {
+                    let physical_root = root.join(&package.install_path);
+                    let bucket = physical_root.parent().unwrap();
+                    let config = bucket.join(".luaurc");
+                    let contents = std::fs::read(&config).unwrap();
+                    assert_eq!(contents.last(), Some(&b'\n'));
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&contents).unwrap(),
+                        serde_json::json!({"aliases": {"packages": "./"}})
+                    );
+                    let relative = config
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .replace('\\', "/");
+                    assert!(info.generated_paths.contains(&relative));
+                    assert!(!info.package_roots.iter().any(|package| {
+                        relative.starts_with(&format!("{}/", package.install_path))
+                    }));
+                    assert!(!physical_root.join(".luaurc").exists());
+                }
+
+                for (consumer, target) in [("a", "x"), ("b", "y")] {
+                    let package = info
+                        .package_roots
+                        .iter()
+                        .find(|package| package.name == format!("fixture/{consumer}"))
+                        .unwrap();
+                    let physical_root = root.join(&package.install_path);
+                    let source = physical_root.join("Source/Module/init.luau");
+                    assert_eq!(
+                        std::fs::read_to_string(&source).unwrap(),
+                        "return require(\"@packages/Util\")\n"
+                    );
+                    let directory = alias_directory(&source);
+                    assert_eq!(
+                        directory,
+                        physical_root.parent().unwrap().canonicalize().unwrap()
+                    );
+                    assert_ne!(directory, root.join(realm).canonicalize().unwrap());
+                    let shim = directory.join("Util.luau");
+                    let link = std::fs::read_to_string(&shim).unwrap();
+                    let require = link
+                        .trim()
+                        .strip_prefix("return require(\"")
+                        .unwrap()
+                        .strip_suffix("\")")
+                        .unwrap();
+                    let destination = directory.join(require).canonicalize().unwrap();
+                    let target_package = info
+                        .package_roots
+                        .iter()
+                        .find(|package| {
+                            package.name == format!("fixture/{target}")
+                                && root.join(&package.install_path).canonicalize().unwrap()
+                                    == destination
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        std::fs::read_to_string(
+                            root.join(&target_package.install_path)
+                                .join("Source/Module/init.luau")
+                        )
+                        .unwrap(),
+                        format!("return {{ Identity = \"{target}\" }}\n")
+                    );
+                    let relative = shim
+                        .strip_prefix(root.canonicalize().unwrap())
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .replace('\\', "/");
+                    assert!(info.generated_paths.contains(&relative));
+                }
+                for directory in ["Packages", "ServerPackages", "DevPackages"] {
+                    let util = root.join(directory).join("Util.luau");
+                    if directory == realm && root_util {
+                        assert!(std::fs::read_to_string(util)
+                            .unwrap()
+                            .contains("fixture_z@"));
+                    } else {
+                        assert!(!util.exists());
+                    }
+                    if root.join(directory).is_dir() {
+                        assert_eq!(
+                            alias_directory(&root.join(directory).join("Consumer.luau")),
+                            root.join(directory).canonicalize().unwrap()
+                        );
+                        assert!(info
+                            .generated_paths
+                            .contains(&format!("{directory}/.luaurc")));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
