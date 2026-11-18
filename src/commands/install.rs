@@ -31,6 +31,7 @@ pub struct InstallSubcommand {
 impl InstallSubcommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
         let root = self.project_path.canonicalize()?;
+        let transaction = crate::install_transaction::InstallTransaction::begin(&root)?;
         let manifest = Manifest::load(&root)?;
 
         let default_registry: Box<PackageSource> = if manifest.package.registry.is_empty() {
@@ -48,7 +49,6 @@ impl InstallSubcommand {
         let mut package_sources =
             PackageSourceMap::new(default_registry).with_project_root(&root)?;
         package_sources.prepare(&manifest)?;
-        let transaction = crate::install_transaction::InstallTransaction::begin(&root)?;
         let lockfile = Lockfile::load(&root)?.unwrap_or_else(|| Lockfile::from_manifest(&manifest));
 
         let try_to_use = lockfile.as_ids().collect();

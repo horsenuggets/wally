@@ -55,6 +55,7 @@ impl InstallTransaction {
         }
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)?;
@@ -169,6 +170,13 @@ impl InstallTransaction {
     }
 
     fn recover(&self) -> anyhow::Result<()> {
+        self.recover_with_step(|| Ok(()))
+    }
+
+    fn recover_with_step(
+        &self,
+        mut after_rename: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         validate_tree(&self.directory)?;
         let owner = self.directory.join("owner");
         match fs_err::read(&owner) {
@@ -178,7 +186,7 @@ impl InstallTransaction {
                 // output. Only remove the partial marker if nothing else is present.
                 ensure!(
                     fs_err::read_dir(&self.directory)?
-                        .all(|entry| entry.map_or(false, |entry| entry.path() == owner)),
+                        .all(|entry| entry.is_ok_and(|entry| entry.path() == owner)),
                     "Incomplete transaction owner with unexpected files. No files were removed."
                 );
                 fs_err::remove_file(owner)?;
@@ -196,9 +204,49 @@ impl InstallTransaction {
             }
             _ => anyhow::bail!("Unrecognized Wally transaction directory. No files were removed."),
         }
+        // Ownership does not authorize deleting unrelated paths beside our fixed slots.
+        for item in fs_err::read_dir(&self.directory)? {
+            let item = item?;
+            ensure!(
+                [
+                    "owner",
+                    "stage",
+                    "backup",
+                    "journal.pending",
+                    "journal.json",
+                    "commit.pending",
+                    "committed"
+                ]
+                .iter()
+                .any(|name| item.file_name() == *name),
+                "Unexpected transaction entry. No files were removed."
+            );
+            let is_directory = item.file_name() == "stage" || item.file_name() == "backup";
+            ensure!(
+                item.file_type()?.is_dir() == is_directory,
+                "Invalid transaction entry type. No files were removed."
+            );
+        }
+        for slot in ["stage", "backup"] {
+            let path = self.directory.join(slot);
+            if path.exists() {
+                ensure!(
+                    path.is_dir(),
+                    "Invalid transaction directory. No files were removed."
+                );
+                for item in fs_err::read_dir(path)? {
+                    let item = item?;
+                    ensure!(
+                        SURFACES.iter().any(|name| item.file_name() == *name),
+                        "Unexpected transaction surface. No files were removed."
+                    );
+                }
+            }
+        }
         let journal_path = self.directory.join("journal.json");
         if !journal_path.exists() {
-            // Before the journal is durable, no live destination has been modified.
+            // Either staging never changed live output, or recovery already finished.
+            // In both cases the owned slots are disposable, even if partly deleted.
             self.cleanup()?;
             return Ok(());
         }
@@ -210,6 +258,10 @@ impl InstallTransaction {
                     .iter()
                     .all(|name| journal.entries.contains_key(*name)),
             "Invalid Wally transaction journal. No files were removed."
+        );
+        ensure!(
+            self.stage().is_dir() && self.directory.join("backup").is_dir(),
+            "Missing transaction directories. No files were removed."
         );
         let committed = self.directory.join("committed").exists();
         if committed {
@@ -242,7 +294,7 @@ impl InstallTransaction {
                 );
             } else if backup.is_some() {
                 ensure!(
-                    current.is_none() || current == entry.new,
+                    current.is_none() || (current == entry.new && staged.is_none()),
                     "Interrupted destination {} changed. No files were removed.",
                     name
                 );
@@ -261,29 +313,40 @@ impl InstallTransaction {
             }
         }
         if !committed {
-            if self.directory.join("backup/wally.install.json").exists()
-                || journal.entries["wally.install.json"].old.is_none()
-            {
-                remove_surface(&self.root.join("wally.install.json"))?;
-                sync_dir(&self.root)?;
+            // Return installed new surfaces to their now-empty staging slots atomically.
+            // Until the journal is removed, every surviving tree keeps its exact hash.
+            // Invalidate new provenance first, then publish original provenance last.
+            let metadata_name = "wally.install.json";
+            let order = std::iter::once(metadata_name).chain(
+                SURFACES
+                    .iter()
+                    .copied()
+                    .filter(|name| *name != metadata_name),
+            );
+            for name in order {
+                let destination = self.root.join(name);
+                if destination.exists()
+                    && (self.directory.join("backup").join(name).exists()
+                        || journal.entries[name].old.is_none())
+                {
+                    fs_err::rename(&destination, self.stage().join(name))?;
+                    sync_dir(&self.root)?;
+                    sync_dir(&self.stage())?;
+                    after_rename()?;
+                }
             }
             for name in SURFACES {
-                let entry = &journal.entries[name];
-                let destination = self.root.join(name);
                 let backup = self.directory.join("backup").join(name);
                 if backup.exists() {
-                    remove_surface(&destination)?;
-                    fs_err::rename(&backup, &destination)?;
+                    fs_err::rename(&backup, self.root.join(name))?;
                     sync_dir(&self.root)?;
                     sync_dir(&self.directory.join("backup"))?;
-                } else if entry.old.is_none() {
-                    remove_surface(&destination)?;
-                    sync_dir(&self.root)?;
+                    after_rename()?;
                 }
             }
         }
-        // Mark rollback complete before deleting the journal. A crash during cleanup
-        // must not reinterpret a partially deleted backup as a missing original.
+        // Retire the journal durably before recursively disposing either generation.
+        // Cleanup must not interpret a partly deleted disposable tree as corruption.
         fs_err::remove_file(self.directory.join("journal.json"))?;
         sync_dir(&self.directory)?;
         self.cleanup()
@@ -372,6 +435,15 @@ fn sync_tree(root: &Path) -> anyhow::Result<()> {
             sync_dir(entry.path())?;
         }
     }
+    Ok(())
+}
+
+fn sync_dir(path: &Path) -> anyhow::Result<()> {
+    // Windows does not support opening directories with ordinary File::open.
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -503,6 +575,144 @@ mod tests {
     }
 
     #[test]
+    fn rollback_restarts_after_every_quarantine_and_restore_rename() {
+        for (old_mask, new_mask) in [(31, 31), (0, 31), (31, 0), (21, 10)] {
+            for publication_cut in 0..=10 {
+                for recovery_cut in 1..=10 {
+                    let temporary = TempDir::new().unwrap();
+                    let root = temporary.path();
+                    for (index, name) in SURFACES.iter().enumerate() {
+                        if old_mask & (1 << index) != 0 {
+                            surface(root, name, "old");
+                        }
+                    }
+                    let transaction = InstallTransaction::begin(root).unwrap();
+                    for (index, name) in SURFACES.iter().enumerate() {
+                        if new_mask & (1 << index) != 0 {
+                            surface(&transaction.stage(), name, "new");
+                        }
+                    }
+                    let journal = prepare_journal(&transaction);
+                    let mut publication = Vec::new();
+                    if journal.entries["wally.install.json"].old.is_some() {
+                        publication.push((
+                            root.join("wally.install.json"),
+                            transaction.directory.join("backup/wally.install.json"),
+                        ));
+                    }
+                    for name in SURFACES {
+                        if name != "wally.install.json" && journal.entries[name].old.is_some() {
+                            publication.push((
+                                root.join(name),
+                                transaction.directory.join("backup").join(name),
+                            ));
+                        }
+                        if journal.entries[name].new.is_some() {
+                            publication.push((transaction.stage().join(name), root.join(name)));
+                        }
+                    }
+                    for (from, to) in publication.iter().take(publication_cut) {
+                        fs_err::rename(from, to).unwrap();
+                    }
+                    let mut steps = 0;
+                    let result = transaction.recover_with_step(|| {
+                        steps += 1;
+                        // Whenever old provenance is visible, all original surfaces
+                        // must already be restored, even at an interruption boundary.
+                        if fingerprint(&root.join("wally.install.json"))?.is_some() {
+                            for name in SURFACES {
+                                assert_eq!(
+                                    fingerprint(&root.join(name))?,
+                                    journal.entries[name].old
+                                );
+                            }
+                        }
+                        ensure!(steps != recovery_cut, "Simulated recovery interruption.");
+                        Ok(())
+                    });
+                    assert_eq!(result.is_err(), steps == recovery_cut);
+                    drop(transaction);
+                    let recovered = InstallTransaction::begin(root).unwrap();
+                    for name in SURFACES {
+                        assert_eq!(fingerprint(&root.join(name)).unwrap(), journal.entries[name].old,
+                            "{name}, publication {publication_cut}, recovery {recovery_cut}, masks {old_mask}/{new_mask}");
+                    }
+                    assert!(!recovered.stage().join("Packages").exists());
+                }
+            }
+        }
+    }
+
+    fn command_recovers_before_source_preparation_failure(update: bool) {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path();
+        let registry = root.join("offline-registry");
+        fs_err::write(root.join("wally.toml"), format!(
+            "[package]\nname = \"test/recovery\"\nversion = \"0.1.0\"\nrealm = \"shared\"\nregistry = {:?}\n[dependencies]\nDependency = \"test/dependency@1.0.0\"\n",
+            registry.to_str().unwrap()
+        )).unwrap();
+        for name in SURFACES {
+            surface(root, name, "old");
+        }
+        let transaction = InstallTransaction::begin(root).unwrap();
+        for name in SURFACES {
+            surface(&transaction.stage(), name, "new");
+        }
+        let journal = prepare_journal(&transaction);
+        for name in SURFACES {
+            fs_err::rename(
+                root.join(name),
+                transaction.directory.join("backup").join(name),
+            )
+            .unwrap();
+            fs_err::rename(transaction.stage().join(name), root.join(name)).unwrap();
+        }
+        drop(transaction);
+        let global = crate::GlobalOptions {
+            test_registry: true,
+            ..Default::default()
+        };
+        let result = if update {
+            crate::UpdateSubcommand {
+                project_path: root.into(),
+                package_specs: Vec::new(),
+            }
+            .run(global)
+        } else {
+            crate::InstallSubcommand {
+                project_path: root.into(),
+                locked: false,
+            }
+            .run(global)
+        };
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("config.json"),
+            "Expected source preparation failure, got {}",
+            error
+        );
+        for name in SURFACES {
+            assert_eq!(
+                fingerprint(&root.join(name)).unwrap(),
+                journal.entries[name].old
+            );
+        }
+        // A failed command releases the lock and leaves only fresh, unprepared staging.
+        let recovered = InstallTransaction::begin(root).unwrap();
+        assert!(!recovered.directory.join("journal.json").exists());
+    }
+
+    #[test]
+    fn install_recovers_before_source_preparation_failure() {
+        command_recovers_before_source_preparation_failure(false);
+    }
+
+    #[test]
+    fn update_recovers_before_source_preparation_failure() {
+        command_recovers_before_source_preparation_failure(true);
+    }
+
+    #[test]
     fn staging_and_recovery_guards_preserve_unexpected_edits() {
         let temporary = TempDir::new().unwrap();
         let root = temporary.path();
@@ -534,6 +744,98 @@ mod tests {
         assert!(root
             .join(".wally-install/backup/Packages/init.luau")
             .exists());
+    }
+
+    #[test]
+    fn recovery_preflights_altered_backups_quarantines_and_unowned_slots() {
+        for altered in [
+            "backup/wally.install.json",
+            "stage/wally.install.json",
+            "unowned",
+            "stage/unowned",
+            "backup/unowned",
+        ] {
+            let temporary = TempDir::new().unwrap();
+            let root = temporary.path();
+            for name in SURFACES {
+                surface(root, name, "old");
+            }
+            let transaction = InstallTransaction::begin(root).unwrap();
+            for name in SURFACES {
+                surface(&transaction.stage(), name, "new");
+            }
+            prepare_journal(&transaction);
+            for name in SURFACES {
+                fs_err::rename(
+                    root.join(name),
+                    transaction.directory.join("backup").join(name),
+                )
+                .unwrap();
+                fs_err::rename(transaction.stage().join(name), root.join(name)).unwrap();
+            }
+            // Model a completed quarantine step, followed by an external edit.
+            fs_err::rename(
+                root.join("wally.install.json"),
+                transaction.stage().join("wally.install.json"),
+            )
+            .unwrap();
+            let altered_path = transaction.directory.join(altered);
+            fs_err::write(&altered_path, "unowned or altered").unwrap();
+            let before = fingerprint(&transaction.directory).unwrap();
+            let live = SURFACES.map(|name| fingerprint(&root.join(name)).unwrap());
+            drop(transaction);
+            assert!(InstallTransaction::begin(root).is_err(), "{}", altered);
+            assert_eq!(fingerprint(&root.join(TRANSACTION_DIR)).unwrap(), before);
+            assert_eq!(
+                SURFACES.map(|name| fingerprint(&root.join(name)).unwrap()),
+                live
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_disposal_after_journal_removal_is_restartable() {
+        for committed in [false, true] {
+            let temporary = TempDir::new().unwrap();
+            let root = temporary.path();
+            for name in SURFACES {
+                surface(root, name, "old");
+            }
+            let transaction = InstallTransaction::begin(root).unwrap();
+            for name in SURFACES {
+                surface(&transaction.stage(), name, "new");
+            }
+            let journal = prepare_journal(&transaction);
+            if committed {
+                for name in SURFACES {
+                    fs_err::rename(
+                        root.join(name),
+                        transaction.directory.join("backup").join(name),
+                    )
+                    .unwrap();
+                    fs_err::rename(transaction.stage().join(name), root.join(name)).unwrap();
+                }
+                durable_write(&transaction.directory.join("committed"), MARKER).unwrap();
+            }
+            // At completed rollback, old surfaces are live and new surfaces are staged.
+            // At completed commit, the opposite generation is disposable in backup.
+            fs_err::remove_file(transaction.directory.join("journal.json")).unwrap();
+            let disposable = transaction
+                .directory
+                .join(if committed { "backup" } else { "stage" });
+            fs_err::remove_file(disposable.join("Packages/init.luau")).unwrap();
+            drop(transaction);
+            let recovered = InstallTransaction::begin(root).unwrap();
+            for name in SURFACES {
+                let expected = if committed {
+                    &journal.entries[name].new
+                } else {
+                    &journal.entries[name].old
+                };
+                assert_eq!(&fingerprint(&root.join(name)).unwrap(), expected);
+            }
+            assert!(!recovered.stage().join("Packages").exists());
+        }
     }
 
     #[test]
@@ -618,13 +920,4 @@ mod tests {
         );
         assert!(!recovered.stage().join("Packages").exists());
     }
-}
-
-fn sync_dir(path: &Path) -> anyhow::Result<()> {
-    // Windows does not support opening directories with ordinary File::open.
-    #[cfg(unix)]
-    File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
