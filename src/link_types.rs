@@ -97,7 +97,7 @@ fn resolve_path(
         for option in ["syncRules", "globIgnorePaths"] {
             if project
                 .get(option)
-                .is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty()))
+                .is_some_and(|value| !matches!(value.as_array(), Some(items) if items.is_empty()))
             {
                 bail!(
                     "Custom Rojo {option} can change the entrypoint mapping and are unsupported."

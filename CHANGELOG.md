@@ -13,6 +13,9 @@
 * Made staged installs recoverable and guarded source paths against traversal and overlap.
 * Forwarded named Luau types, generic defaults, and type packs through generated links.
 * Scoped installed package aliases to their shared, server, or development realm.
+* Fixed durable staged-file flushing on Windows and added release-platform coverage.
+* Declared Rust 1.89 as the minimum compiler required by the resolved dependency graph,
+  aligned the backend build image, and checked the minimum compiler in CI.
 * Rejected local dependencies and versionless packages at registry publication boundaries.
 * Isolated integration fixtures and preserved the pinned registry backend dependency commit
   through its current public repository URL.

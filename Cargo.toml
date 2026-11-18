@@ -2,6 +2,7 @@
 name = "wally"
 description = "Wally is a modern package manager for Roblox projects inspired by Cargo."
 version = "0.3.2-horse.6.0"
+rust-version = "1.89"
 license = "MPL-2.0"
 authors = ["Lucien Greathouse <lucien@uplift.games>"]
 edition = "2018"
