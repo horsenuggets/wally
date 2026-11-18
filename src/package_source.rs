@@ -21,6 +21,7 @@ use crate::package_req::PackageReq;
 pub enum PackageSourceId {
     DefaultRegistry,
     Git(String),
+    Local(String),
     Path(PathBuf),
 }
 
@@ -28,6 +29,7 @@ pub enum PackageSourceId {
 pub struct PackageSourceMap {
     sources: HashMap<PackageSourceId, Box<PackageSource>>,
     source_order: Vec<PackageSourceId>,
+    project_root: Option<PathBuf>,
 }
 
 impl PackageSourceMap {
@@ -38,7 +40,60 @@ impl PackageSourceMap {
         Self {
             sources,
             source_order: vec![PackageSourceId::DefaultRegistry],
+            project_root: None,
         }
+    }
+
+    pub fn with_project_root(mut self, root: &std::path::Path) -> anyhow::Result<Self> {
+        self.project_root = Some(root.canonicalize()?);
+        Ok(self)
+    }
+
+    /// Discover local manifests without contacting the network. Only initialize registry
+    /// fallbacks if a reachable registry requirement actually needs them.
+    pub fn prepare(&mut self, manifest: &Manifest) -> anyhow::Result<()> {
+        crate::resolution::validate_aliases(manifest, true)?;
+        let mut queue = vec![manifest.clone()];
+        let mut visited = std::collections::BTreeSet::new();
+        let mut needs_registry = false;
+        while let Some(package) = queue.pop() {
+            for req in package
+                .dependencies
+                .values()
+                .chain(package.server_dependencies.values())
+                .chain(package.dev_dependencies.values())
+            {
+                match req {
+                    crate::package_req::DependencyReq::Registry(_) => needs_registry = true,
+                    crate::package_req::DependencyReq::Local(path)
+                        if visited.insert(path.clone()) =>
+                    {
+                        let directory =
+                            crate::local_packages::source_directory(self.project_root()?, path)?;
+                        let mut local = Manifest::load(&directory)?;
+                        crate::resolution::validate_aliases(&local, false)?;
+                        // Development requirements are only activated at the consuming root.
+                        local.dev_dependencies.clear();
+                        queue.push(local);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if needs_registry {
+            anyhow::ensure!(
+                !manifest.package.registry.is_empty(),
+                "Registry dependencies require a registry in the consuming root manifest."
+            );
+            self.add_fallbacks()?;
+        }
+        Ok(())
+    }
+
+    pub fn project_root(&self) -> anyhow::Result<&std::path::Path> {
+        self.project_root
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Local dependencies require a consuming project root."))
     }
 
     pub fn get(&self, id: &PackageSourceId) -> Option<&PackageSource> {
@@ -67,6 +122,9 @@ impl PackageSourceMap {
                         }
                         PackageSourceId::Path(path) => {
                             Box::new(PackageSource::TestRegistry(TestRegistry::new(path.clone())))
+                        }
+                        PackageSourceId::Local(_) => {
+                            anyhow::bail!("Local packages cannot be registry fallback sources.")
                         }
                         PackageSourceId::DefaultRegistry => {
                             panic!("Default registry should never be added as a fallback source!")

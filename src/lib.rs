@@ -1,7 +1,10 @@
 pub mod auth;
 pub mod commands;
 pub mod git_util;
+mod install_transaction;
 pub mod installation;
+mod link_types;
+pub mod local_packages;
 pub mod lockfile;
 pub mod manifest;
 pub mod package_contents;

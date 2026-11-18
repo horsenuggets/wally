@@ -22,10 +22,10 @@ metadata:
     origin_realms:
       - dev
     source_registry: DefaultRegistry
-shared_dependencies: {}
-server_dependencies: {}
-dev_dependencies:
+shared_dependencies:
   biff/dev-dep@1.0.0:
     TestUtil: biff/test-util@1.0.0
+server_dependencies: {}
+dev_dependencies:
   biff/root@1.0.0:
     DevDep: biff/dev-dep@1.0.0

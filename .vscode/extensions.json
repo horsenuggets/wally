@@ -1,0 +1,3 @@
+{
+  "recommendations": ["hashicorp.hcl", "hashicorp.terraform", "jkillian.custom-local-formatters"]
+}

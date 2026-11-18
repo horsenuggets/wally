@@ -1,7 +1,7 @@
-use std::io::{self, BufRead, BufReader, Cursor};
+use std::io::{self, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 
-use anyhow::format_err;
+use anyhow::{format_err, Context};
 use fs_err::File;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde_json::json;
@@ -13,6 +13,7 @@ use crate::manifest::Manifest;
 static EXCLUDED_GLOBS: &[&str] = &[
     ".*",
     "wally.lock",
+    "wally.install.json",
     "Packages",
     "ServerPackages",
     "DevPackages",
@@ -52,16 +53,16 @@ impl PackageContents {
             } else {
                 archive.start_file(archive_name, FileOptions::default())?;
 
-                if path.ends_with("default.project.json") {
+                if relative_path == Path::new("default.project.json") {
                     let project_file = File::open(path)?;
                     let mut project_json: serde_json::Value =
                         serde_json::from_reader(project_file)?;
-                    let project_name = project_json
-                        .get("name")
-                        .and_then(|name| name.as_str())
-                        .expect("Couldn't parse name in default.project.json");
+                    let object = project_json
+                        .as_object_mut()
+                        .context("default.project.json must be an object.")?;
+                    let project_name = object.get("name").and_then(|name| name.as_str());
 
-                    if project_name != package_name {
+                    if project_name != Some(package_name) {
                         log::info!(
                             "The project and package names are mismatched. The project name in \
                              `default.project.json` has been renamed to '{}' in the uploaded \
@@ -69,7 +70,7 @@ impl PackageContents {
                             package_name
                         );
 
-                        *project_json.get_mut("name").unwrap() = json!(package_name);
+                        object.insert("name".into(), json!(package_name));
                     }
 
                     serde_json::to_writer_pretty(&mut archive, &project_json)?;
@@ -98,16 +99,13 @@ impl PackageContents {
         let includes = manifest.package.include;
         let mut excludes = manifest.package.exclude;
 
-        if includes.is_empty() && Path::new(".gitignore").exists() {
-            let gitignore = File::open(Path::new(".gitignore"))?;
-
-            BufReader::new(gitignore)
-                .lines()
-                .flatten()
-                .for_each(|pattern| {
-                    excludes.push(pattern);
-                });
+        let mut gitignore = ignore::gitignore::GitignoreBuilder::new(input);
+        if includes.is_empty() && input.join(".gitignore").exists() {
+            if let Some(error) = gitignore.add(input.join(".gitignore")) {
+                return Err(error.into());
+            }
         }
+        let gitignore = gitignore.build()?;
 
         EXCLUDED_GLOBS
             .iter()
@@ -117,21 +115,19 @@ impl PackageContents {
         let include = build_glob_set(&includes)?;
         let exclude = build_glob_set(&excludes)?;
 
-        Ok(WalkDir::new(input)
+        let entries = WalkDir::new(input)
             .min_depth(1)
             .into_iter()
             .filter_entry(|entry| {
                 let relative = entry.path().strip_prefix(input).unwrap();
-
-                if !includes.is_empty() && !include.matches(relative).is_empty() {
-                    return true;
-                };
-
-                exclude.matches(relative).is_empty()
-            })
-            .flatten()
-            .map(|entry| entry.path().to_path_buf())
-            .collect())
+                relative == Path::new("wally.toml")
+                    || (!includes.is_empty() && include.is_match(relative))
+                    || (exclude.matches(relative).is_empty()
+                        && !gitignore
+                            .matched(entry.path(), entry.file_type().is_dir())
+                            .is_ignore())
+            });
+        collect_contents(input, &include, !includes.is_empty(), entries)
     }
 
     pub fn data(&self) -> &[u8] {
@@ -144,12 +140,102 @@ impl PackageContents {
     }
 }
 
+fn collect_contents(
+    input: &Path,
+    include: &GlobSet,
+    restrict_includes: bool,
+    entries: impl IntoIterator<Item = Result<walkdir::DirEntry, walkdir::Error>>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        anyhow::ensure!(
+            !entry.file_type().is_symlink(),
+            "Package contents cannot contain symbolic links at {}.",
+            entry.path().display()
+        );
+        let relative = entry.path().strip_prefix(input)?;
+        if relative == Path::new("wally.toml")
+            || !restrict_includes
+            || entry.file_type().is_dir()
+            || include.is_match(relative)
+        {
+            paths.push(entry.into_path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 fn build_glob_set(patterns: &[String]) -> anyhow::Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
 
     for pattern in patterns {
+        let anchored = pattern.starts_with('/');
+        let pattern = pattern.trim_start_matches('/').trim_end_matches('/');
+        if pattern.is_empty() {
+            continue;
+        }
         builder.add(Glob::new(pattern)?);
+        builder.add(Glob::new(&format!("{}/**", pattern))?);
+        if !anchored && !pattern.contains('/') {
+            builder.add(Glob::new(&format!("**/{}", pattern))?);
+            builder.add(Glob::new(&format!("**/{}/**", pattern))?);
+        }
     }
 
     Ok(builder.build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_manifest_is_packaged_despite_include_exclude_and_ignore_rules() {
+        for version in ["version = \"1.0.0\"\n", ""] {
+            for filtering in ["include = [\"/src\"]\n", "exclude = [\"wally.toml\"]\n", ""] {
+                let temporary = tempfile::tempdir().unwrap();
+                let root = temporary.path();
+                let manifest = format!(
+                    "[package]\nname = \"fixture/contents\"\n{version}realm = \"shared\"\n{filtering}"
+                );
+                fs_err::write(root.join("wally.toml"), &manifest).unwrap();
+                fs_err::write(root.join(".gitignore"), "wally.toml\nother.luau\n").unwrap();
+                fs_err::create_dir(root.join("src")).unwrap();
+                fs_err::write(root.join("src/init.luau"), "return 1\n").unwrap();
+                fs_err::write(root.join("other.luau"), "return 2\n").unwrap();
+                let paths = PackageContents::filtered_contents(root).unwrap();
+                assert_eq!(
+                    paths
+                        .iter()
+                        .filter(|path| *path == &root.join("wally.toml"))
+                        .count(),
+                    1
+                );
+                assert!(!paths.contains(&root.join("other.luau")));
+
+                let package = PackageContents::pack_from_path(root).unwrap();
+                let mut archive = ZipArchive::new(Cursor::new(package.data())).unwrap();
+                let mut actual = String::new();
+                std::io::Read::read_to_string(
+                    &mut archive.by_name("wally.toml").unwrap(),
+                    &mut actual,
+                )
+                .unwrap();
+                assert_eq!(actual, manifest);
+                assert!(archive.by_name("src/init.luau").is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn walk_errors_are_propagated_instead_of_flattened_away() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("missing");
+        let include = build_glob_set(&[]).unwrap();
+        // Exercise a genuine WalkDir error independently of manifest loading, which
+        // would otherwise fail first and mask a regression in the traversal collector.
+        assert!(collect_contents(&missing, &include, false, WalkDir::new(&missing)).is_err());
+    }
 }

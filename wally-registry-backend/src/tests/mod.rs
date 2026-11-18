@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use figment::{providers::Serialized, Figment};
 use libwally::test_package::PackageBuilder;
@@ -9,7 +9,13 @@ use rocket::{
 
 use crate::{auth::AuthMode, config::Config, server, storage::StorageMode};
 
-fn init_test_index_remote() -> anyhow::Result<url::Url> {
+#[derive(Clone)]
+struct TestIndex {
+    url: url::Url,
+    _directory: Arc<tempfile::TempDir>,
+}
+
+fn init_test_index_remote() -> anyhow::Result<TestIndex> {
     let temp_dir = tempfile::tempdir()?;
     let repo = git2::Repository::init_bare(temp_dir.path())?;
     let sig = git2::Signature::now("PackageUser", "PackageUser@localhost")?;
@@ -27,7 +33,10 @@ fn init_test_index_remote() -> anyhow::Result<url::Url> {
         &[],
     )?;
 
-    Ok(url::Url::from_directory_path(temp_dir.into_path()).unwrap())
+    Ok(TestIndex {
+        url: url::Url::from_directory_path(temp_dir.path()).unwrap(),
+        _directory: Arc::new(temp_dir),
+    })
 }
 
 fn add_test_packages(output_dir: &Path) -> anyhow::Result<()> {
@@ -48,21 +57,24 @@ fn new_client(auth: AuthMode) -> Client {
     new_client_with_remote(auth, init_test_index_remote().unwrap())
 }
 
-fn new_client_with_remote(auth: AuthMode, index_url: url::Url) -> Client {
-    let package_path = tempfile::tempdir().unwrap().into_path();
-    add_test_packages(&package_path).unwrap();
+fn new_client_with_remote(auth: AuthMode, index: TestIndex) -> Client {
+    let package_directory = tempfile::tempdir().unwrap();
+    add_test_packages(package_directory.path()).unwrap();
 
     let figment = Figment::from(rocket::Config::default()).merge(Serialized::globals(Config {
-        index_url,
+        index_url: index.url.clone(),
         storage: StorageMode::Local {
-            path: Some(package_path),
+            path: Some(package_directory.path().to_owned()),
         },
         auth,
         github_token: None,
         minimum_wally_version: None,
     }));
 
-    Client::tracked(server(figment)).expect("valid rocket instance")
+    // The client owns fixture directories, including shared remote indexes, so tests
+    // clean up automatically instead of leaking every temporary repository and package.
+    Client::tracked(server(figment).manage((index, package_directory)))
+        .expect("valid rocket instance")
 }
 
 struct Expectation {
@@ -104,6 +116,25 @@ impl Expectation {
             );
         }
     }
+}
+
+#[test]
+fn fixture_directories_are_removed_when_the_client_is_dropped() {
+    let index = init_test_index_remote().unwrap();
+    let index_path = index._directory.path().to_owned();
+    let client = new_client_with_remote(AuthMode::Unauthenticated, index);
+    let package_path = client
+        .rocket()
+        .state::<(TestIndex, tempfile::TempDir)>()
+        .unwrap()
+        .1
+        .path()
+        .to_owned();
+    assert!(index_path.exists());
+    assert!(package_path.exists());
+    drop(client);
+    assert!(!index_path.exists());
+    assert!(!package_path.exists());
 }
 
 #[test]
@@ -253,8 +284,9 @@ fn publish_duplicate() {
 #[test]
 fn publish_updates_git_remote() {
     let remote = init_test_index_remote().unwrap();
-    let repo = git2::Repository::open(remote.to_file_path().unwrap()).unwrap();
+    let remote_path = remote.url.to_file_path().unwrap();
     let client = new_client_with_remote(AuthMode::ApiKey(String::from("hello")), remote);
+    let repo = git2::Repository::open(remote_path).unwrap();
 
     let commit = repo.head().unwrap().peel_to_commit().unwrap();
     assert_eq!(commit.message().unwrap(), "Initial commit");

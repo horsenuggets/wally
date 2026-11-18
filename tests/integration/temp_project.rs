@@ -10,6 +10,10 @@ pub struct TempProject {
 }
 
 impl TempProject {
+    pub fn empty() -> anyhow::Result<Self> {
+        Ok(Self { dir: tempdir()? })
+    }
+
     pub fn new(source: &Path) -> anyhow::Result<Self> {
         let dir = tempdir()?;
         copy_dir_all(source, dir.path())?;

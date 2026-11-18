@@ -1,5 +1,10 @@
 # Cargo build output
-/target
+/target/
+
+# Generated Wally installation state
+.wally-install/
+.wally-install.lock
+wally.install.json
 
 # Insta uncommitted snapshots
 *.snap.new
@@ -7,4 +12,17 @@
 *.DS_Store
 
 .local
-.vscode
+# Keep shared formatter settings, but ignore other local VS Code files.
+/.vscode/*
+!/.vscode/extensions.json
+!/.vscode/settings.json
+/TODO.md
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Worktrees
+/.worktrees/
+/.wt/

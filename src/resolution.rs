@@ -3,12 +3,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use anyhow::bail;
 use anyhow::format_err;
-use semver::Version;
 use serde::Serialize;
 
 use crate::manifest::{Manifest, Realm};
 use crate::package_id::PackageId;
-use crate::package_req::PackageReq;
+use crate::package_req::DependencyReq;
 use crate::package_source::{PackageSourceId, PackageSourceMap, PackageSourceProvider};
 
 /// A completely resolved graph of packages returned by `resolve`.
@@ -17,6 +16,10 @@ use crate::package_source::{PackageSourceId, PackageSourceMap, PackageSourceProv
 /// concurrent mutable access to unrelated information about different packages.
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct Resolve {
+    #[serde(skip)]
+    pub(crate) registry: String,
+    #[serde(skip)]
+    pub manifest_hashes: BTreeMap<String, String>,
     /// Set of all packages that have been chosen to be part of the package
     /// graph.
     pub activated: BTreeSet<PackageId>,
@@ -73,6 +76,16 @@ impl ResolvePackageMetadata {
             Realm::Dev
         }
     }
+
+    /// A local source has one installed module identity. Consumers in other realms
+    /// link to its primary installation instead of creating independent copies.
+    pub fn installation_realms(&self, package: &PackageId) -> BTreeSet<Realm> {
+        if package.local_path().is_some() {
+            BTreeSet::from([self.origin_realm()])
+        } else {
+            self.origin_realms.clone()
+        }
+    }
 }
 
 pub fn resolve(
@@ -80,7 +93,19 @@ pub fn resolve(
     try_to_use: &BTreeSet<PackageId>,
     package_sources: &PackageSourceMap,
 ) -> anyhow::Result<Resolve> {
-    let mut resolve = Resolve::default();
+    let mut resolve = Resolve {
+        registry: root_manifest.package.registry.clone(),
+        ..Resolve::default()
+    };
+    validate_aliases(root_manifest, true)?;
+    if let Some(hash) = &root_manifest.content_hash {
+        resolve
+            .manifest_hashes
+            .insert("wally.toml".into(), hash.clone());
+    }
+    let mut manifests = BTreeMap::new();
+    manifests.insert(root_manifest.package_id(), root_manifest.clone());
+    let mut local_names = BTreeMap::new();
 
     // Insert root project into graph and activated dependencies, as it'll
     // always be present.
@@ -134,18 +159,26 @@ pub fn resolve(
         let mut matching_activated: Vec<_> = resolve
             .activated
             .iter()
-            .filter(|package_id| package_id.name() == dependency_request.package_req.name())
+            .filter(|package_id| match &dependency_request.package_req {
+                DependencyReq::Registry(req) => {
+                    package_id.local_path().is_none() && package_id.name() == req.name()
+                }
+                DependencyReq::Local(path) => package_id.local_path() == Some(path.as_str()),
+            })
             .cloned()
             .collect();
 
         // Sort our list of candidates by descending version so that we can pick
         // newest candidates first.
-        matching_activated.sort_by(|a, b| b.version().cmp(a.version()));
+        matching_activated.sort_by(|a, b| b.version().cmp(&a.version()));
 
         // Check for the highest version already-activated package that matches
         // our constraints.
         for package_id in &matching_activated {
-            if dependency_request.package_req.matches_id(package_id) {
+            if match &dependency_request.package_req {
+                DependencyReq::Registry(req) => req.matches_id(package_id),
+                DependencyReq::Local(_) => true,
+            } {
                 let metadata = resolve
                     .metadata
                     .get_mut(package_id)
@@ -154,15 +187,25 @@ pub fn resolve(
                 // Add this origin realm to the set of realms where this package
                 // needs to be installed. Dev dependencies get separate copies from
                 // shared/server dependencies.
-                metadata.origin_realms.insert(dependency_request.origin_realm);
-
-                // Use the primary origin realm for the dependency graph
-                let primary_realm = metadata.origin_realm();
+                if !Realm::is_dependency_valid(dependency_request.request_realm, metadata.realm) {
+                    continue;
+                }
+                let added = metadata
+                    .origin_realms
+                    .insert(dependency_request.origin_realm);
+                if added {
+                    enqueue_dependencies(
+                        &mut packages_to_visit,
+                        package_id,
+                        &manifests[package_id],
+                        dependency_request.origin_realm,
+                    );
+                }
 
                 resolve.activate(
                     dependency_request.request_source.clone(),
                     dependency_request.package_alias.clone(),
-                    primary_realm,
+                    dependency_request.request_realm,
                     package_id.clone(),
                 );
 
@@ -171,25 +214,41 @@ pub fn resolve(
         }
 
         // Look through all our packages sources in order of priority
-        let (source_registry, mut candidates) = package_sources
-            .source_order()
-            .iter()
-            .find_map(|source| {
-                let registry = package_sources.get(source).unwrap();
-
-                // Pull all of the possible candidate versions of the package we're
-                // looking for from the highest priority source which has them.
-                match registry.query(&dependency_request.package_req) {
-                    Ok(manifests) => Some((source, manifests)),
-                    Err(_) => None,
+        let (source_registry, mut candidates) = match &dependency_request.package_req {
+            DependencyReq::Local(path) => {
+                let root = package_sources.project_root()?;
+                let source = crate::local_packages::source_directory(root, path)?;
+                let manifest = Manifest::load(&source)?;
+                resolve.manifest_hashes.insert(
+                    format!("{}/wally.toml", path),
+                    manifest.content_hash.clone().unwrap(),
+                );
+                validate_aliases(&manifest, false)?;
+                if let Some(previous) =
+                    local_names.insert(manifest.package.name.clone(), path.clone())
+                {
+                    anyhow::ensure!(
+                        previous == *path,
+                        "Ambiguous local package identity {} at both {} and {}.",
+                        manifest.package.name,
+                        previous,
+                        path
+                    );
                 }
-            })
-            .ok_or_else(|| {
-                format_err!(
-                    "Failed to find a source for {}",
-                    dependency_request.package_req
-                )
-            })?;
+                (PackageSourceId::Local(path.clone()), vec![manifest])
+            }
+            DependencyReq::Registry(req) => package_sources
+                .source_order()
+                .iter()
+                .find_map(|source| {
+                    let registry = package_sources.get(source).unwrap();
+                    match registry.query(req) {
+                        Ok(manifests) if !manifests.is_empty() => Some((source.clone(), manifests)),
+                        _ => None,
+                    }
+                })
+                .ok_or_else(|| format_err!("Failed to find a source for {}", req))?,
+        };
 
         // Sort our candidate packages by descending version, so that we try the
         // highest versions first.
@@ -219,9 +278,10 @@ pub fn resolve(
             // to only allow one compatible copy of a given package to prevent
             // common user errors.
 
-            let has_conflicting = matching_activated
-                .iter()
-                .any(|activated| compatible(&candidate.package.version, activated.version()));
+            let has_conflicting = matching_activated.iter().any(|activated| {
+                activated.version().is_some()
+                    && candidate.package.version.as_ref() == activated.version()
+            });
 
             if has_conflicting {
                 // This is a matching candidate, but it conflicts with a
@@ -233,15 +293,22 @@ pub fn resolve(
                 continue;
             }
 
-            let candidate_id = PackageId::new(
-                candidate.package.name.clone(),
-                candidate.package.version.clone(),
-            );
+            validate_aliases(candidate, false)?;
+            let candidate_id = match &dependency_request.package_req {
+                DependencyReq::Local(path) => {
+                    PackageId::local(candidate.package.name.clone(), path.clone())
+                }
+                DependencyReq::Registry(_) => {
+                    candidate.validate_publish()?;
+                    candidate.package_id()
+                }
+            };
+            manifests.insert(candidate_id.clone(), candidate.clone());
 
             resolve.activate(
                 dependency_request.request_source.clone(),
                 dependency_request.package_alias.to_owned(),
-                dependency_request.origin_realm,
+                dependency_request.request_realm,
                 candidate_id.clone(),
             );
 
@@ -254,25 +321,12 @@ pub fn resolve(
                 },
             );
 
-            for (alias, req) in &candidate.dependencies {
-                packages_to_visit.push_back(DependencyRequest {
-                    request_source: candidate_id.clone(),
-                    request_realm: Realm::Shared,
-                    origin_realm: dependency_request.origin_realm,
-                    package_alias: alias.clone(),
-                    package_req: req.clone(),
-                })
-            }
-
-            for (alias, req) in &candidate.server_dependencies {
-                packages_to_visit.push_back(DependencyRequest {
-                    request_source: candidate_id.clone(),
-                    request_realm: Realm::Server,
-                    origin_realm: dependency_request.origin_realm,
-                    package_alias: alias.clone(),
-                    package_req: req.clone(),
-                })
-            }
+            enqueue_dependencies(
+                &mut packages_to_visit,
+                &candidate_id,
+                candidate,
+                dependency_request.origin_realm,
+            );
 
             continue 'outer;
         }
@@ -301,15 +355,106 @@ pub fn resolve(
         }
     }
 
+    validate_cycles(&resolve)?;
     Ok(resolve)
 }
 
-fn compatible(a: &Version, b: &Version) -> bool {
-    // Only consider exact version matches as conflicts.
-    // This allows multiple different versions of the same package to be installed,
-    // enabling proper dependency isolation where each package uses its own
-    // version of shared dependencies.
-    a == b
+fn enqueue_dependencies(
+    queue: &mut VecDeque<DependencyRequest>,
+    id: &PackageId,
+    manifest: &Manifest,
+    origin: Realm,
+) {
+    for (realm, dependencies) in [
+        (Realm::Shared, &manifest.dependencies),
+        (Realm::Server, &manifest.server_dependencies),
+    ] {
+        for (alias, req) in dependencies {
+            queue.push_back(DependencyRequest {
+                request_source: id.clone(),
+                request_realm: realm,
+                origin_realm: Realm::dependency_origin(origin, realm),
+                package_alias: alias.clone(),
+                package_req: req.clone(),
+            });
+        }
+    }
+}
+
+pub(crate) fn validate_aliases(manifest: &Manifest, is_root: bool) -> anyhow::Result<()> {
+    let mut aliases = BTreeSet::new();
+    for (realm, dependencies) in [
+        (Realm::Shared, &manifest.dependencies),
+        (Realm::Server, &manifest.server_dependencies),
+        (Realm::Dev, &manifest.dev_dependencies),
+    ] {
+        if is_root {
+            aliases.clear();
+        } else if realm == Realm::Dev {
+            continue;
+        }
+        for alias in dependencies.keys() {
+            anyhow::ensure!(
+                !alias.is_empty()
+                    && !alias.eq_ignore_ascii_case("_Index")
+                    && !crate::package_req::is_reserved_path_component(alias)
+                    && alias
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "Unsafe dependency alias {:?}.",
+                alias
+            );
+            anyhow::ensure!(
+                aliases.insert(alias.to_ascii_lowercase()),
+                "Duplicate dependency alias {:?}.",
+                alias
+            );
+            anyhow::ensure!(
+                is_root || !alias.eq_ignore_ascii_case(manifest.package.name.name()),
+                "Dependency alias {:?} collides with package {} in its index directory.",
+                alias,
+                manifest.package.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_cycles(resolve: &Resolve) -> anyhow::Result<()> {
+    fn visit(
+        id: &PackageId,
+        resolve: &Resolve,
+        visiting: &mut BTreeSet<PackageId>,
+        done: &mut BTreeSet<PackageId>,
+    ) -> anyhow::Result<()> {
+        if done.contains(id) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            visiting.insert(id.clone()),
+            "Dependency cycle involving {}.",
+            id
+        );
+        for graph in [
+            &resolve.shared_dependencies,
+            &resolve.server_dependencies,
+            &resolve.dev_dependencies,
+        ] {
+            if let Some(deps) = graph.get(id) {
+                for dep in deps.values() {
+                    visit(dep, resolve, visiting, done)?;
+                }
+            }
+        }
+        visiting.remove(id);
+        done.insert(id.clone());
+        Ok(())
+    }
+    let mut done = BTreeSet::new();
+    for id in &resolve.activated {
+        visit(id, resolve, &mut BTreeSet::new(), &mut done)?;
+    }
+    Ok(())
 }
 
 pub struct DependencyRequest {
@@ -317,7 +462,7 @@ pub struct DependencyRequest {
     request_realm: Realm,
     origin_realm: Realm,
     package_alias: String,
-    package_req: PackageReq,
+    package_req: DependencyReq,
 }
 
 #[cfg(test)]
@@ -328,11 +473,15 @@ mod tests {
         package_name::PackageName, package_source::InMemoryRegistry, test_package::PackageBuilder,
     };
 
-    fn test_project(registry: InMemoryRegistry, package: PackageBuilder) -> anyhow::Result<()> {
+    fn test_project(
+        name: &str,
+        registry: InMemoryRegistry,
+        package: PackageBuilder,
+    ) -> anyhow::Result<()> {
         let package_sources = PackageSourceMap::new(Box::new(registry.source()));
         let manifest = package.into_manifest();
         let resolve = resolve(&manifest, &Default::default(), &package_sources)?;
-        insta::assert_yaml_snapshot!(resolve);
+        insta::assert_yaml_snapshot!(name, resolve);
         Ok(())
     }
 
@@ -341,7 +490,7 @@ mod tests {
         let registry = InMemoryRegistry::new();
 
         let root = PackageBuilder::new("biff/minimal@0.1.0");
-        test_project(registry, root)
+        test_project("minimal", registry, root)
     }
 
     #[test]
@@ -352,7 +501,7 @@ mod tests {
 
         let root = PackageBuilder::new("biff/one-dependency@0.1.0")
             .with_dep("Minimal", "biff/minimal@0.1.0");
-        test_project(registry, root)
+        test_project("one_dependency", registry, root)
     }
 
     #[test]
@@ -366,7 +515,7 @@ mod tests {
 
         let root = PackageBuilder::new("biff/transitive-dependency@0.1.0")
             .with_dep("OneDependency", "biff/one-dependency@0.1.0");
-        test_project(registry, root)
+        test_project("transitive_dependency", registry, root)
     }
 
     /// When there are shared dependencies, Wally should select the same
@@ -382,7 +531,7 @@ mod tests {
             .with_dep("B", "biff/b@1.0.0")
             .with_dep("C", "biff/c@1.0.0");
 
-        test_project(registry, root)
+        test_project("unified_dependencies", registry, root)
     }
 
     /// Server dependencies are allowed to depend on shared dependencies. If a
@@ -401,7 +550,7 @@ mod tests {
         let root =
             PackageBuilder::new("biff/root@1.0.0").with_server_dep("Server", "biff/server@1.0.0");
 
-        test_project(registry, root)
+        test_project("server_to_shared", registry, root)
     }
 
     /// but... if that shared dependency is required by another shared dependency,
@@ -420,7 +569,7 @@ mod tests {
             .with_server_dep("Server", "biff/server@1.0.0")
             .with_dep("Shared", "biff/shared@1.0.0");
 
-        test_project(registry, root)
+        test_project("server_to_shared_and_shared_to_shared", registry, root)
     }
 
     /// Shared dependencies are allowed to depend on server dependencies. Server
@@ -433,7 +582,47 @@ mod tests {
         let root =
             PackageBuilder::new("biff/root@1.0.0").with_server_dep("Server", "biff/server@1.0.0");
 
-        test_project(registry, root)
+        test_project("shared_to_server", registry, root)
+    }
+
+    #[test]
+    fn incompatible_activated_realms_do_not_hide_valid_registry_versions() {
+        for preactivate_shared in [false, true] {
+            let registry = InMemoryRegistry::new();
+            registry.publish(PackageBuilder::new("biff/util@1.0.0"));
+            registry.publish(PackageBuilder::new("biff/util@2.0.0").with_realm(Realm::Server));
+            registry.publish(
+                PackageBuilder::new("biff/bridge@1.0.0").with_dep("Util", "biff/util@>=1.0.0"),
+            );
+            let mut root = PackageBuilder::new("biff/root@1.0.0")
+                .with_dep("Bridge", "biff/bridge@1.0.0")
+                .with_server_dep("ServerUtil", "biff/util@=2.0.0");
+            if preactivate_shared {
+                root = root.with_dep("ActivatedShared", "biff/util@=1.0.0");
+            }
+            let sources = PackageSourceMap::new(Box::new(registry.source()));
+
+            let resolved = resolve(root.manifest(), &BTreeSet::new(), &sources).unwrap();
+
+            let shared: PackageId = "biff/util@1.0.0".parse().unwrap();
+            let server: PackageId = "biff/util@2.0.0".parse().unwrap();
+            let bridge: PackageId = "biff/bridge@1.0.0".parse().unwrap();
+            assert_eq!(resolved.shared_dependencies[&bridge]["Util"], shared);
+            assert_eq!(
+                resolved.server_dependencies[&root.manifest().package_id()]["ServerUtil"],
+                server
+            );
+            assert_eq!(
+                resolved.metadata[&shared].origin_realms,
+                BTreeSet::from([Realm::Shared])
+            );
+            assert_eq!(
+                resolved.metadata[&server].origin_realms,
+                BTreeSet::from([Realm::Server])
+            );
+            assert!(resolved.activated.contains(&shared));
+            assert!(resolved.activated.contains(&server));
+        }
     }
 
     #[test]
@@ -445,7 +634,7 @@ mod tests {
 
         let package_sources = PackageSourceMap::new(Box::new(registry.source()));
         let err = resolve(root.manifest(), &Default::default(), &package_sources).unwrap_err();
-        insta::assert_display_snapshot!(err);
+        insta::assert_snapshot!(err);
     }
 
     /// Tests the simple one dependency case, except that a new version of the
@@ -554,12 +743,11 @@ mod tests {
         let registry = InMemoryRegistry::new();
         registry.publish(PackageBuilder::new("biff/test-util@1.0.0"));
         registry.publish(
-            PackageBuilder::new("biff/dev-dep@1.0.0")
-                .with_dep("TestUtil", "biff/test-util@1.0.0"),
+            PackageBuilder::new("biff/dev-dep@1.0.0").with_dep("TestUtil", "biff/test-util@1.0.0"),
         );
 
-        let root = PackageBuilder::new("biff/root@1.0.0")
-            .with_dev_dep("DevDep", "biff/dev-dep@1.0.0");
+        let root =
+            PackageBuilder::new("biff/root@1.0.0").with_dev_dep("DevDep", "biff/dev-dep@1.0.0");
 
         let package_sources = PackageSourceMap::new(Box::new(registry.source()));
         let resolved = resolve(root.manifest(), &Default::default(), &package_sources)?;

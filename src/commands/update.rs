@@ -12,7 +12,7 @@ use crate::package_name::PackageName;
 use crate::package_req::PackageReq;
 use crate::package_source::{PackageSource, PackageSourceMap, Registry, TestRegistry};
 use crate::{resolution, GlobalOptions};
-use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+use crossterm::style::{Color, SetForegroundColor};
 use indicatif::{ProgressBar, ProgressStyle};
 use structopt::StructOpt;
 
@@ -32,14 +32,13 @@ pub struct UpdateSubcommand {
 
 impl UpdateSubcommand {
     pub fn run(self, global: GlobalOptions) -> anyhow::Result<()> {
-        let manifest = Manifest::load(&self.project_path)?;
+        let root = self.project_path.canonicalize()?;
+        let transaction = crate::install_transaction::InstallTransaction::begin(&root)?;
+        let manifest = Manifest::load(&root)?;
 
-        let lockfile = match Lockfile::load(&self.project_path)? {
-            Some(lockfile) => lockfile,
-            None => Lockfile::from_manifest(&manifest),
-        };
-
-        let default_registry: Box<PackageSource> = if global.test_registry {
+        let default_registry: Box<PackageSource> = if manifest.package.registry.is_empty() {
+            Box::new(crate::package_source::InMemoryRegistry::new().source())
+        } else if global.test_registry {
             Box::new(PackageSource::TestRegistry(TestRegistry::new(
                 &manifest.package.registry,
             )))
@@ -49,8 +48,10 @@ impl UpdateSubcommand {
             )?))
         };
 
-        let mut package_sources = PackageSourceMap::new(default_registry);
-        package_sources.add_fallbacks()?;
+        let mut package_sources =
+            PackageSourceMap::new(default_registry).with_project_root(&root)?;
+        package_sources.prepare(&manifest)?;
+        let lockfile = Lockfile::load(&root)?.unwrap_or_else(|| Lockfile::from_manifest(&manifest));
 
         // If the user didn't specify any targets, then update all of the packages.
         // Otherwise, find the target packages to update.
@@ -107,43 +108,14 @@ impl UpdateSubcommand {
             render_update_difference(&dependency_changes, &mut std::io::stdout()).unwrap();
         });
 
-        Lockfile::from_resolve(&resolved_graph).save(&self.project_path)?;
-
-        progress.println(format!(
-            "{}    Updated {}lockfile",
-            SetForegroundColor(Color::DarkGreen),
-            SetForegroundColor(Color::Reset)
-        ));
-
-        let root_package_id = manifest.package_id();
-        let installation_context = InstallationContext::new(
-            &self.project_path,
-            manifest.place.shared_packages,
-            manifest.place.server_packages,
-        );
-
-        progress.set_message(format!(
-            "{}  Cleaning {}package destination...",
-            SetForegroundColor(Color::DarkGreen),
-            SetForegroundColor(Color::Reset)
-        ));
-
-        installation_context.clean()?;
-
-        progress.println(format!(
-            "{}    Cleaned {}package destination",
-            SetForegroundColor(Color::DarkGreen),
-            SetForegroundColor(Color::Reset)
-        ));
-
-        progress.finish_with_message(format!(
-            "{}{}  Starting installation {}",
-            SetAttribute(Attribute::Bold),
-            SetForegroundColor(Color::DarkGreen),
-            SetForegroundColor(Color::Reset)
-        ));
-
-        installation_context.install(package_sources, root_package_id, resolved_graph)?;
+        progress.finish_and_clear();
+        InstallationContext::install_atomic(
+            &root,
+            package_sources,
+            &manifest,
+            resolved_graph,
+            transaction,
+        )?;
 
         Ok(())
     }
@@ -153,9 +125,7 @@ impl UpdateSubcommand {
             .iter()
             .any(|target_package| match target_package {
                 PackageSpec::Named(named_target) => package_id.name() == named_target,
-                PackageSpec::Required(required_target) => {
-                    required_target.matches(package_id.name(), package_id.version())
-                }
+                PackageSpec::Required(required_target) => required_target.matches_id(package_id),
             })
     }
 }
