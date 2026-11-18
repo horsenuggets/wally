@@ -222,8 +222,9 @@ impl InstallationContext {
             }
         }
 
-        // Package dependencies use the installed realm's namespace, not the consuming
-        // project's shared alias. The configuration belongs to the generated surface.
+        // Root consumers use realm aliases, while installed sources use the private
+        // dependency shims in their own index bucket. Keep both configurations outside
+        // physical package roots so source contents stay intact and provenance owns them.
         let mut aliases = serde_json::to_vec_pretty(&serde_json::json!({
             "aliases": { "packages": "./" }
         }))?;
@@ -231,6 +232,23 @@ impl InstallationContext {
         for directory in [&self.shared_dir, &self.server_dir, &self.dev_dir] {
             if directory.is_dir() {
                 fs::write(directory.join(".luaurc"), &aliases)?;
+            }
+        }
+
+        for id in &resolved.activated {
+            if id == &root_package_id {
+                continue;
+            }
+            for realm in resolved.metadata[id].installation_realms(id) {
+                let index = match realm {
+                    Realm::Shared => &self.shared_index_dir,
+                    Realm::Server => &self.server_index_dir,
+                    Realm::Dev => &self.dev_index_dir,
+                };
+                fs::write(
+                    index.join(package_id_file_name(id)).join(".luaurc"),
+                    &aliases,
+                )?;
             }
         }
 
