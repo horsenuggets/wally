@@ -12,7 +12,12 @@
 * Added source-aware lock metadata and install provenance for authoritative local sources.
 * Made staged installs recoverable and guarded source paths against traversal and overlap.
 * Forwarded named Luau types, generic defaults, and type packs through generated links.
-* Scoped installed package aliases to their shared, server, or development realm.
+* Scoped installed package aliases to their shared, server, or development realm and
+  isolated each installed package's private dependency namespace.
+* Made rollback interruption-safe by quarantining new output atomically before restoring
+  originals, and recovered interrupted installs before registry preparation.
+* Always included root manifests in archives, independently of package filtering rules.
+* Skipped incompatible activated realms when another valid registry version can resolve.
 * Fixed durable staged-file flushing on Windows and added release-platform coverage.
 * Declared Rust 1.89 as the minimum compiler required by the resolved dependency graph,
   aligned the backend build image, and checked the minimum compiler in CI.

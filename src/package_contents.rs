@@ -120,7 +120,8 @@ impl PackageContents {
             .into_iter()
             .filter_entry(|entry| {
                 let relative = entry.path().strip_prefix(input).unwrap();
-                (!includes.is_empty() && include.is_match(relative))
+                relative == Path::new("wally.toml")
+                    || (!includes.is_empty() && include.is_match(relative))
                     || (exclude.matches(relative).is_empty()
                         && !gitignore
                             .matched(entry.path(), entry.file_type().is_dir())
@@ -154,27 +155,16 @@ fn collect_contents(
             entry.path().display()
         );
         let relative = entry.path().strip_prefix(input)?;
-        if !restrict_includes || entry.file_type().is_dir() || include.is_match(relative) {
+        if relative == Path::new("wally.toml")
+            || !restrict_includes
+            || entry.file_type().is_dir()
+            || include.is_match(relative)
+        {
             paths.push(entry.into_path());
         }
     }
     paths.sort();
     Ok(paths)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn walk_errors_are_propagated_instead_of_flattened_away() {
-        let temporary = tempfile::tempdir().unwrap();
-        let missing = temporary.path().join("missing");
-        let include = build_glob_set(&[]).unwrap();
-        // Exercise a genuine WalkDir error independently of manifest loading, which
-        // would otherwise fail first and mask a regression in the traversal collector.
-        assert!(collect_contents(&missing, &include, false, WalkDir::new(&missing)).is_err());
-    }
 }
 
 fn build_glob_set(patterns: &[String]) -> anyhow::Result<GlobSet> {
@@ -195,4 +185,57 @@ fn build_glob_set(patterns: &[String]) -> anyhow::Result<GlobSet> {
     }
 
     Ok(builder.build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_manifest_is_packaged_despite_include_exclude_and_ignore_rules() {
+        for version in ["version = \"1.0.0\"\n", ""] {
+            for filtering in ["include = [\"/src\"]\n", "exclude = [\"wally.toml\"]\n", ""] {
+                let temporary = tempfile::tempdir().unwrap();
+                let root = temporary.path();
+                let manifest = format!(
+                    "[package]\nname = \"fixture/contents\"\n{version}realm = \"shared\"\n{filtering}"
+                );
+                fs_err::write(root.join("wally.toml"), &manifest).unwrap();
+                fs_err::write(root.join(".gitignore"), "wally.toml\nother.luau\n").unwrap();
+                fs_err::create_dir(root.join("src")).unwrap();
+                fs_err::write(root.join("src/init.luau"), "return 1\n").unwrap();
+                fs_err::write(root.join("other.luau"), "return 2\n").unwrap();
+                let paths = PackageContents::filtered_contents(root).unwrap();
+                assert_eq!(
+                    paths
+                        .iter()
+                        .filter(|path| *path == &root.join("wally.toml"))
+                        .count(),
+                    1
+                );
+                assert!(!paths.contains(&root.join("other.luau")));
+
+                let package = PackageContents::pack_from_path(root).unwrap();
+                let mut archive = ZipArchive::new(Cursor::new(package.data())).unwrap();
+                let mut actual = String::new();
+                std::io::Read::read_to_string(
+                    &mut archive.by_name("wally.toml").unwrap(),
+                    &mut actual,
+                )
+                .unwrap();
+                assert_eq!(actual, manifest);
+                assert!(archive.by_name("src/init.luau").is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn walk_errors_are_propagated_instead_of_flattened_away() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("missing");
+        let include = build_glob_set(&[]).unwrap();
+        // Exercise a genuine WalkDir error independently of manifest loading, which
+        // would otherwise fail first and mask a regression in the traversal collector.
+        assert!(collect_contents(&missing, &include, false, WalkDir::new(&missing)).is_err());
+    }
 }
