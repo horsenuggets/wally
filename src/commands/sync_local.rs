@@ -1,6 +1,6 @@
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use anyhow::{ensure, Context};
@@ -33,11 +33,6 @@ impl SyncLocalSubcommand {
             "Standard-input ownership requires watch mode."
         );
         let mut sync = LocalSync::new(&self.project_path)?;
-        sync.refresh()?;
-        println!("Local package mirrors are synchronized.");
-        if !self.watch {
-            return Ok(());
-        }
         let receiver = self.shutdown_on_stdin_eof.then(|| {
             let (shutdown, receiver) = mpsc::channel();
             std::thread::spawn(move || {
@@ -46,26 +41,52 @@ impl SyncLocalSubcommand {
             });
             receiver
         });
-        loop {
-            if let Some(receiver) = &receiver {
-                match receiver.recv_timeout(WATCH_INTERVAL) {
-                    Ok(result) => {
-                        return result
-                            .context("Could not monitor the owning process's standard input.")
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => {
-                        anyhow::bail!("The standard-input ownership monitor stopped unexpectedly.")
-                    }
+        synchronize(
+            || sync.refresh(),
+            self.watch,
+            receiver,
+            || {
+                println!("Local package mirrors are synchronized.");
+            },
+        )
+    }
+}
+
+fn synchronize(
+    mut refresh: impl FnMut() -> anyhow::Result<usize>,
+    watch: bool,
+    receiver: Option<Receiver<std::io::Result<()>>>,
+    mut announce_ready: impl FnMut(),
+) -> anyhow::Result<()> {
+    let mut ready = false;
+    loop {
+        match refresh() {
+            Ok(count) => {
+                if ready {
+                    report_refresh(count);
+                } else {
+                    announce_ready();
+                    ready = true;
                 }
-            } else {
-                std::thread::sleep(WATCH_INTERVAL);
             }
-            match sync.refresh() {
-                Ok(count) => report_refresh(count),
-                Err(error) if error.is::<SourceChanged>() => log::warn!("{error}"),
-                Err(error) => return Err(error),
+            Err(error) if watch && error.is::<SourceChanged>() => log::warn!("{error}"),
+            Err(error) => return Err(error),
+        }
+        if !watch {
+            return Ok(());
+        }
+        if let Some(receiver) = &receiver {
+            match receiver.recv_timeout(WATCH_INTERVAL) {
+                Ok(result) => {
+                    return result.context("Could not monitor the owning process's standard input.")
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("The standard-input ownership monitor stopped unexpectedly.")
+                }
             }
+        } else {
+            std::thread::sleep(WATCH_INTERVAL);
         }
     }
 }
@@ -94,6 +115,43 @@ fn wait_for_eof(mut input: impl Read) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_retries_initial_source_changes_before_announcing_readiness() {
+        let attempts = std::cell::Cell::new(0);
+        let announced_at = std::cell::Cell::new(0);
+        let (shutdown, receiver) = mpsc::channel();
+        synchronize(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= 3 {
+                    return Err(SourceChanged.into());
+                }
+                shutdown.send(Ok(())).unwrap();
+                Ok(1)
+            },
+            true,
+            Some(receiver),
+            || announced_at.set(attempts.get()),
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 4);
+        assert_eq!(announced_at.get(), 4);
+    }
+
+    #[test]
+    fn one_shot_source_changes_fail_without_announcing_readiness() {
+        let announced = std::cell::Cell::new(false);
+        let error = synchronize(
+            || Err(SourceChanged.into()),
+            false,
+            None,
+            || announced.set(true),
+        )
+        .unwrap_err();
+        assert!(error.is::<SourceChanged>());
+        assert!(!announced.get());
+    }
 
     #[test]
     fn ownership_waits_for_eof_instead_of_the_first_input_bytes() {
