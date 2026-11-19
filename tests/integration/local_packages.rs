@@ -154,6 +154,80 @@ fn local_mirror_watch_updates_dev_only_outputs_and_stops_on_owned_stdin_eof() {
 }
 
 #[test]
+fn local_mirror_watch_recovers_initial_source_loss_and_can_stop_before_readiness() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for recover in [false, true] {
+        let project = TempProject::empty().unwrap();
+        let root = project.path();
+        root_manifest(root, "[dependencies]\nCode = '^Forks/code'");
+        local(root, "Forks/code", "code", "shared", "");
+        install(root, false).unwrap();
+        std::fs::rename(
+            root.join("Forks/code/Source"),
+            root.join("Forks/code/parked"),
+        )
+        .unwrap();
+        let mut watcher = LocalWatcher(
+            Command::new(env!("CARGO_BIN_EXE_wally"))
+                .arg("sync-local")
+                .arg("--project-path")
+                .arg(root)
+                .arg("--watch")
+                .arg("--shutdown-on-stdin-eof")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let output = watcher.0.stdout.take().unwrap();
+        let (lines, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                if lines.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(watcher.0.try_wait().unwrap().is_none());
+        if recover {
+            std::fs::rename(
+                root.join("Forks/code/parked"),
+                root.join("Forks/code/Source"),
+            )
+            .unwrap();
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(20)).unwrap(),
+                "Local package mirrors are synchronized."
+            );
+        }
+        drop(watcher.0.stdin.take());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = watcher.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Owned watcher did not stop."
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        reader.join().unwrap();
+        assert!(receiver.try_iter().next().is_none());
+    }
+}
+
+#[test]
 fn local_mirror_watch_ignores_closed_stdin_without_the_ownership_flag() {
     use std::process::{Command, Stdio};
 
