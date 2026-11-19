@@ -44,6 +44,9 @@ fn source_read_error(error: anyhow::Error) -> anyhow::Error {
             .downcast_ref::<std::io::Error>()
             .or_else(|| cause.downcast_ref::<walkdir::Error>()?.io_error())
             .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            || cause
+                .downcast_ref::<serde_json::Error>()
+                .is_some_and(serde_json::Error::is_eof)
     }) {
         SourceChanged.into()
     } else {
@@ -111,7 +114,9 @@ impl LocalSync {
             metadata.local_manifests == hashes,
             "Local package ownership is stale. Run \"wally install\"."
         );
-        metadata.verify_manifests(&root)?;
+        metadata
+            .verify_manifests(&root)
+            .map_err(source_read_error)?;
         let mut represented = BTreeSet::new();
         let mut destinations = BTreeSet::new();
         let mut mirrors = Vec::new();
@@ -183,7 +188,7 @@ impl LocalSync {
             );
             if let Some(source) = &package.source_path {
                 mirrors.push(Mirror {
-                    source: source_directory(&root, source)?,
+                    source: source_directory(&root, source).map_err(source_read_error)?,
                     destination,
                 });
             }
@@ -318,8 +323,8 @@ fn declarations(root: &Path) -> anyhow::Result<BTreeMap<String, Declaration>> {
     let mut names = BTreeMap::new();
     while let Some((path, request, origin)) = pending.pop_front() {
         if !declarations.contains_key(&path) {
-            let directory = source_directory(root, &path)?;
-            let manifest = Manifest::load(&directory)?;
+            let directory = source_directory(root, &path).map_err(source_read_error)?;
+            let manifest = Manifest::load(&directory).map_err(source_read_error)?;
             ensure!(
                 names
                     .insert(manifest.package.name.clone(), path.clone())
@@ -627,8 +632,9 @@ mod tests {
             .unwrap();
             assert_eq!(original["name"], "different-name");
         }
-        assert_eq!(protected(root), preserved);
         assert_eq!(sync.refresh().unwrap(), 0);
+        drop(sync);
+        assert_eq!(protected(root), preserved);
     }
 
     #[test]
@@ -672,6 +678,53 @@ mod tests {
             "Forks/shared/wally.toml",
             "[package]\nname = 'fixture/changed'\nrealm = 'shared'\n",
         );
+        assert!(!sync.refresh().unwrap_err().is::<SourceChanged>());
+    }
+
+    #[test]
+    fn initialization_retries_only_source_read_failures() {
+        let temporary = fixture();
+        let root = temporary.path();
+        fs_err::rename(
+            root.join("Forks/shared/src"),
+            root.join("Forks/shared/parked"),
+        )
+        .unwrap();
+        assert!(LocalSync::new(root).err().unwrap().is::<SourceChanged>());
+        fs_err::rename(
+            root.join("Forks/shared/parked"),
+            root.join("Forks/shared/src"),
+        )
+        .unwrap();
+        assert!(LocalSync::new(root).is_ok());
+        write(root, METADATA_FILE, "{");
+        assert!(!LocalSync::new(root).err().unwrap().is::<SourceChanged>());
+    }
+
+    #[test]
+    fn incomplete_source_projects_preserve_mirrors_until_the_save_finishes() {
+        let temporary = fixture();
+        let root = temporary.path();
+        let project = fs_err::read(root.join("Forks/shared/default.project.json")).unwrap();
+        let mut sync = LocalSync::new(root).unwrap();
+        sync.refresh().unwrap();
+        let before = fingerprint(&installed(root, "shared")).unwrap();
+        write(root, "Forks/shared/src/init.luau", "return 'saved'\n");
+        for incomplete in ["", "{", "{\"tree\":"] {
+            write(root, "Forks/shared/default.project.json", incomplete);
+            assert!(sync.refresh().unwrap_err().is::<SourceChanged>());
+            assert_eq!(fingerprint(&installed(root, "shared")).unwrap(), before);
+        }
+        drop(sync);
+        assert!(LocalSync::new(root).err().unwrap().is::<SourceChanged>());
+        write(root, "Forks/shared/default.project.json", project);
+        let mut sync = LocalSync::new(root).unwrap();
+        assert_eq!(sync.refresh().unwrap(), 1);
+        assert_eq!(
+            fs_err::read_to_string(installed(root, "shared").join("src/init.luau")).unwrap(),
+            "return 'saved'\n"
+        );
+        write(root, "Forks/shared/default.project.json", "{invalid}");
         assert!(!sync.refresh().unwrap_err().is::<SourceChanged>());
     }
 

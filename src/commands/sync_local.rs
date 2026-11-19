@@ -32,7 +32,7 @@ impl SyncLocalSubcommand {
             self.watch || !self.shutdown_on_stdin_eof,
             "Standard-input ownership requires watch mode."
         );
-        let mut sync = LocalSync::new(&self.project_path)?;
+        let mut sync = None;
         let receiver = self.shutdown_on_stdin_eof.then(|| {
             let (shutdown, receiver) = mpsc::channel();
             std::thread::spawn(move || {
@@ -42,7 +42,12 @@ impl SyncLocalSubcommand {
             receiver
         });
         synchronize(
-            || sync.refresh(),
+            || {
+                if sync.is_none() {
+                    sync = Some(LocalSync::new(&self.project_path)?);
+                }
+                sync.as_mut().unwrap().refresh()
+            },
             self.watch,
             receiver,
             || {
@@ -137,6 +142,26 @@ mod tests {
         .unwrap();
         assert_eq!(attempts.get(), 4);
         assert_eq!(announced_at.get(), 4);
+    }
+
+    #[test]
+    fn ownership_can_stop_retries_before_readiness() {
+        let attempts = std::cell::Cell::new(0);
+        let announced = std::cell::Cell::new(false);
+        let (shutdown, receiver) = mpsc::channel();
+        synchronize(
+            || {
+                attempts.set(attempts.get() + 1);
+                shutdown.send(Ok(())).unwrap();
+                Err(SourceChanged.into())
+            },
+            true,
+            Some(receiver),
+            || announced.set(true),
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 1);
+        assert!(!announced.get());
     }
 
     #[test]
