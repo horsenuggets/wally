@@ -1,6 +1,11 @@
 # Wally Changelog
 
 ## Unreleased Changes
+* Added offline `sync-local` refresh and watch support for generated local-package mirrors
+  in shared, server, and development installations, without promoting generated edits
+  into source or changing registry packages, aliases, manifests, or lockfiles.
+* Added opt-in standard-input ownership for local mirror watchers so launchers can stop
+  their own watcher without terminating unrelated processes.
 * Added --locked flag for the install subcommand ([#119])
 * Improved lockfile formatting for better text diffs ([#214])
 
