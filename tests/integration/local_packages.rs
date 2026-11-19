@@ -65,6 +65,137 @@ fn metadata(root: &Path) -> InstallMetadata {
     serde_json::from_slice(&std::fs::read(root.join("wally.install.json")).unwrap()).unwrap()
 }
 
+struct LocalWatcher(std::process::Child);
+
+impl Drop for LocalWatcher {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn wait_for_mirror(watcher: &mut LocalWatcher, path: &Path, expected: &[u8]) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::fs::read(path).ok().as_deref() != Some(expected) {
+        assert!(
+            watcher.0.try_wait().unwrap().is_none(),
+            "Local watcher exited before refreshing its mirror."
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Local mirror refresh timed out."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn local_mirror_watch_updates_dev_only_outputs_and_stops_on_owned_stdin_eof() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let project = TempProject::empty().unwrap();
+    let root = project.path();
+    root_manifest(root, "[dev-dependencies]\nDeveloper = '^Forks/developer'");
+    local(root, "Forks/developer", "developer", "shared", "");
+    install(root, false).unwrap();
+    let mirror =
+        root.join("DevPackages/_Index/fixture_developer@local/developer/Source/Module/init.luau");
+    std::fs::write(&mirror, "return 'generated-only'\n").unwrap();
+    let provenance = std::fs::read(root.join("wally.install.json")).unwrap();
+    let mut watcher = LocalWatcher(
+        Command::new(env!("CARGO_BIN_EXE_wally"))
+            .arg("sync-local")
+            .arg("--project-path")
+            .arg(root)
+            .arg("--watch")
+            .arg("--shutdown-on-stdin-eof")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_mirror(&mut watcher, &mirror, b"return {}\n");
+    write(
+        root,
+        "Forks/developer/Source/Module/init.luau",
+        "return 'new-source'\n",
+    );
+    wait_for_mirror(&mut watcher, &mirror, b"return 'new-source'\n");
+    let mut input = watcher.0.stdin.take().unwrap();
+    input.write_all(b"The owner is still alive.\n").unwrap();
+    input.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(watcher.0.try_wait().unwrap().is_none());
+    drop(input);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(status) = watcher.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Owned watcher did not stop after stdin closed."
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(root.join("wally.install.json")).unwrap(),
+        provenance
+    );
+    assert!(!root
+        .join("Packages/_Index/fixture_developer@local")
+        .exists());
+    assert!(!root
+        .join("ServerPackages/_Index/fixture_developer@local")
+        .exists());
+}
+
+#[test]
+fn local_mirror_watch_ignores_closed_stdin_without_the_ownership_flag() {
+    use std::process::{Command, Stdio};
+
+    let project = TempProject::empty().unwrap();
+    let root = project.path();
+    root_manifest(root, "[dependencies]\nCode = '^Forks/code'");
+    local(root, "Forks/code", "code", "shared", "");
+    install(root, false).unwrap();
+    let mirror = root.join("Packages/_Index/fixture_code@local/code/Source/Module/init.luau");
+    std::fs::write(&mirror, "return 'generated-only'\n").unwrap();
+    let mut watcher = LocalWatcher(
+        Command::new(env!("CARGO_BIN_EXE_wally"))
+            .arg("sync-local")
+            .arg("--project-path")
+            .arg(root)
+            .arg("--watch")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_mirror(&mut watcher, &mirror, b"return {}\n");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(watcher.0.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn local_mirror_stdin_ownership_requires_watch_mode_before_touching_the_project() {
+    let project = TempProject::empty().unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_wally"))
+        .arg("sync-local")
+        .arg("--project-path")
+        .arg(project.path())
+        .arg("--shutdown-on-stdin-eof")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--watch"));
+    assert!(!project.path().join(".wally-install.lock").exists());
+}
+
 #[test]
 fn caret_parsing_is_distinct_from_registry_semver_in_all_sections() {
     let manifest = Manifest::from_slice(
