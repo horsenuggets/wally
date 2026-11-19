@@ -7,6 +7,15 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## `0.3.2-horse.6.1`
+* Added offline `sync-local` refresh and watch support for generated local-package mirrors
+  in shared, server, and development installations, without promoting generated edits
+  into source or changing registry packages, aliases, manifests, or lockfiles.
+* Added opt-in standard-input ownership for local mirror watchers so launchers can stop
+  their own watcher without terminating unrelated processes.
+* Retried transient source changes during initial and ongoing mirror refreshes, announcing
+  watcher readiness only after a successful initial synchronization.
+
 ## `0.3.2-horse.6.0`
 * Added versionless local dependencies with caret-prefixed workspace paths in every realm.
 * Added source-aware lock metadata and install provenance for authoritative local sources.

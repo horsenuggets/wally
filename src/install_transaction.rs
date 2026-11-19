@@ -44,23 +44,29 @@ struct Entry {
     new: Option<String>,
 }
 
+pub(crate) fn lock_installation(root: &Path) -> anyhow::Result<File> {
+    let lock_path = root.join(INSTALL_LOCK_FILE);
+    if let Ok(metadata) = fs_err::symlink_metadata(&lock_path) {
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "Unsafe install lock path."
+        );
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.try_lock_exclusive().context(
+        "Another Wally installation or local mirror watcher is running for this project.",
+    )?;
+    Ok(lock)
+}
+
 impl InstallTransaction {
     pub fn begin(root: &Path) -> anyhow::Result<Self> {
-        let lock_path = root.join(INSTALL_LOCK_FILE);
-        if let Ok(metadata) = fs_err::symlink_metadata(&lock_path) {
-            ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "Unsafe install lock path."
-            );
-        }
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
-        lock.try_lock_exclusive()
-            .context("Another Wally installation is running for this project.")?;
+        let lock = lock_installation(root)?;
         let mut transaction = Self {
             root: root.into(),
             directory: root.join(TRANSACTION_DIR),
@@ -380,7 +386,7 @@ fn remove_surface(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn fingerprint(path: &Path) -> anyhow::Result<Option<String>> {
+pub(crate) fn fingerprint(path: &Path) -> anyhow::Result<Option<String>> {
     match fs_err::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -438,7 +444,7 @@ fn sync_tree(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sync_dir(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> anyhow::Result<()> {
     // Windows does not support opening directories with ordinary File::open.
     #[cfg(unix)]
     File::open(path)?.sync_all()?;

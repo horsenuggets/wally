@@ -5,6 +5,7 @@ mod install_transaction;
 pub mod installation;
 mod link_types;
 pub mod local_packages;
+mod local_sync;
 pub mod lockfile;
 pub mod manifest;
 pub mod package_contents;
