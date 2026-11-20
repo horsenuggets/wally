@@ -4,6 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Component, Path, PathBuf},
+    rc::Rc,
 };
 
 use anyhow::{bail, Context};
@@ -222,7 +223,6 @@ fn syntax(node: &impl Node) -> String {
 type ModuleId = Vec<String>;
 type AliasId = (ModuleId, String);
 
-#[derive(Clone)]
 struct TypeModule {
     aliases: BTreeMap<String, TypeDeclaration>,
     exported: BTreeSet<String>,
@@ -455,7 +455,7 @@ type Captures = BTreeSet<(bool, String)>;
 
 struct DefaultTypes<'a> {
     root: &'a Path,
-    modules: BTreeMap<ModuleId, TypeModule>,
+    modules: BTreeMap<ModuleId, Rc<TypeModule>>,
     required: BTreeSet<AliasId>,
     defaults: BTreeSet<AliasId>,
     applications: BTreeMap<ApplicationId, Captures>,
@@ -469,16 +469,16 @@ struct DefaultNames {
 }
 
 impl DefaultTypes<'_> {
-    fn module(&mut self, id: &ModuleId) -> anyhow::Result<TypeModule> {
+    fn module(&mut self, id: &ModuleId) -> anyhow::Result<Rc<TypeModule>> {
         if !self.modules.contains_key(id) {
             let path = import_path(self.root, id)?;
             let entry = resolve_path(self.root, &path, &mut BTreeSet::new())?
                 .context("Imported type module has no ModuleScript entrypoint.")?;
             let module = TypeModule::parse(&fs::read_to_string(&entry)?)
                 .with_context(|| format!("Cannot read imported types from {}", entry.display()))?;
-            self.modules.insert(id.clone(), module);
+            self.modules.insert(id.clone(), Rc::new(module));
         }
-        Ok(self.modules[id].clone())
+        Ok(Rc::clone(&self.modules[id]))
     }
 
     fn imported_alias(
@@ -671,7 +671,7 @@ fn import_id(root: &Path, id: &ModuleId, expression: &Expression) -> anyhow::Res
 
 fn declarations(root: &Path, entry: &Path) -> anyhow::Result<ForwardedTypes> {
     let entry_id = Vec::new();
-    let entry = TypeModule::parse(&fs::read_to_string(entry)?)?;
+    let entry = Rc::new(TypeModule::parse(&fs::read_to_string(entry)?)?);
     if entry
         .exported
         .iter()
@@ -681,7 +681,7 @@ fn declarations(root: &Path, entry: &Path) -> anyhow::Result<ForwardedTypes> {
     }
     let mut types = DefaultTypes {
         root,
-        modules: BTreeMap::from([(entry_id.clone(), entry.clone())]),
+        modules: BTreeMap::from([(entry_id.clone(), Rc::clone(&entry))]),
         required: BTreeSet::new(),
         defaults: BTreeSet::new(),
         applications: BTreeMap::new(),
@@ -1297,6 +1297,33 @@ mod tests {
         let temp = TempDir::new().unwrap();
         write(temp.path(), "init.luau", source);
         exports(temp.path())
+    }
+
+    #[test]
+    fn parsed_module_lookups_share_immutable_storage() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "return {}");
+        write(
+            temp.path(),
+            "Types.luau",
+            "local Runtime = {}\nexport type Value = { Item: string }\nreturn Runtime",
+        );
+        let root = temp.path().canonicalize().unwrap();
+        let mut types = DefaultTypes {
+            root: &root,
+            modules: BTreeMap::new(),
+            required: BTreeSet::new(),
+            defaults: BTreeSet::new(),
+            applications: BTreeMap::new(),
+            application_bodies: BTreeMap::new(),
+        };
+        let id = vec!["Types".to_owned()];
+        let first = types.module(&id).unwrap();
+        let second = types.module(&id).unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        assert!(Rc::ptr_eq(&first, &types.modules[&id]));
+        assert!(first.aliases.contains_key("Value"));
+        assert!(first.bindings.contains_key("Runtime"));
     }
 
     #[test]
