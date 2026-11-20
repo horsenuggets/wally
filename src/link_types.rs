@@ -9,9 +9,13 @@ use std::{
 use anyhow::{bail, Context};
 use fs_err as fs;
 use full_moon::{
-    ast::{luau::TypeInfo, Stmt},
+    ast::{
+        luau::{IndexedTypeInfo, TypeDeclaration, TypeInfo},
+        Call, Expression, FunctionArgs, Index, Prefix, Stmt, Suffix, Var,
+    },
     node::Node,
-    visitors::{Visit, Visitor},
+    tokenizer::{Token, TokenReference, TokenType},
+    visitors::{Visit, VisitMut, Visitor, VisitorMut},
 };
 
 #[derive(Clone, Default)]
@@ -27,7 +31,7 @@ pub(crate) fn exports(root: &Path) -> anyhow::Result<ForwardedTypes> {
     let entry = resolve_path(&root, &root, &mut BTreeSet::new())
         .with_context(|| format!("Cannot resolve package entrypoint in {}", root.display()))?;
     match entry {
-        Some(entry) => declarations(&fs::read_to_string(&entry)?)
+        Some(entry) => declarations(&root, &entry)
             .with_context(|| format!("Cannot forward named types from {}", entry.display())),
         None => Ok(ForwardedTypes::default()),
     }
@@ -62,25 +66,9 @@ fn resolve_path(
                 );
             }
             check_metadata(&path.join("init.meta.json"))?;
-            let candidates: Vec<_> = [
-                "init.luau",
-                "init.lua",
-                "init.server.luau",
-                "init.server.lua",
-                "init.client.luau",
-                "init.client.lua",
-                "init.legacy.luau",
-                "init.legacy.lua",
-                "init.local.luau",
-                "init.local.lua",
-                "init.plugin.luau",
-                "init.plugin.lua",
-                "init.csv",
-            ]
-            .iter()
-            .map(|name| path.join(name))
-            .filter(|path| path.is_file())
-            .collect();
+            let candidates: Vec<_> = module_candidates(&path, "init")
+                .filter(|path| path.is_file())
+                .collect();
             match candidates.as_slice() {
                 [] => None,
                 [entry] => resolve_path(root, entry, visiting)?,
@@ -166,6 +154,26 @@ fn resolve_path(
     Ok(result)
 }
 
+fn module_candidates<'a>(directory: &'a Path, name: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
+    [
+        ".luau",
+        ".lua",
+        ".server.luau",
+        ".server.lua",
+        ".client.luau",
+        ".client.lua",
+        ".legacy.luau",
+        ".legacy.lua",
+        ".local.luau",
+        ".local.lua",
+        ".plugin.luau",
+        ".plugin.lua",
+        ".csv",
+    ]
+    .iter()
+    .map(move |suffix| directory.join(format!("{name}{suffix}")))
+}
+
 fn check_metadata(path: &Path) -> anyhow::Result<()> {
     if path.with_extension("jsonc").exists() {
         bail!(
@@ -204,123 +212,494 @@ fn syntax(node: &impl Node) -> String {
         .join(" ")
 }
 
-fn declarations(source: &str) -> anyhow::Result<ForwardedTypes> {
-    let ast = full_moon::parse(source)
-        .map_err(|errors| anyhow::anyhow!("Invalid Luau entrypoint, {errors:?}"))?;
-    let mut private = BTreeSet::new();
-    let mut private_declarations = BTreeMap::new();
-    let mut required_private = BTreeSet::new();
-    let mut exported = BTreeSet::new();
-    for statement in ast.nodes().stmts() {
-        match statement {
-            Stmt::TypeDeclaration(declaration) => {
+// Module identities are paths in the staged instance tree, not just source files.
+// Redirects can mount the same file at different instance paths.
+type ModuleId = Vec<String>;
+type AliasId = (ModuleId, String);
+
+#[derive(Clone)]
+struct TypeModule {
+    aliases: BTreeMap<String, TypeDeclaration>,
+    exported: BTreeSet<String>,
+    functions: BTreeSet<String>,
+    bindings: BTreeMap<String, (usize, Option<Expression>)>,
+    ambiguous: BTreeSet<String>,
+    tokens: BTreeSet<String>,
+}
+
+impl TypeModule {
+    fn parse(source: &str) -> anyhow::Result<Self> {
+        let ast = full_moon::parse(source)
+            .map_err(|errors| anyhow::anyhow!("Invalid Luau entrypoint, {errors:?}"))?;
+        let mut module = Self {
+            aliases: BTreeMap::new(),
+            exported: BTreeSet::new(),
+            functions: BTreeSet::new(),
+            bindings: BTreeMap::new(),
+            ambiguous: BTreeSet::new(),
+            tokens: ast
+                .nodes()
+                .tokens()
+                .map(|t| t.token().to_string())
+                .collect(),
+        };
+        for statement in ast.nodes().stmts() {
+            let declaration = match statement {
+                Stmt::TypeDeclaration(declaration) => Some(declaration.as_ref()),
+                Stmt::ExportedTypeDeclaration(export) => {
+                    module
+                        .exported
+                        .insert(syntax(export.type_declaration().type_name()));
+                    Some(export.type_declaration())
+                }
+                Stmt::TypeFunction(function) => {
+                    module.functions.insert(syntax(function.function_name()));
+                    None
+                }
+                Stmt::ExportedTypeFunction(function) => {
+                    let name = syntax(function.type_function().function_name());
+                    module.exported.insert(name.clone());
+                    module.functions.insert(name);
+                    None
+                }
+                Stmt::LocalAssignment(assignment) => {
+                    module.bind(assignment.names().iter(), assignment.expressions().iter());
+                    None
+                }
+                Stmt::ConstAssignment(assignment) => {
+                    module.bind(assignment.names().iter(), assignment.expressions().iter());
+                    None
+                }
+                Stmt::LocalFunction(function) => {
+                    module.bind(std::iter::once(function.name()), std::iter::empty());
+                    None
+                }
+                _ => None,
+            };
+            if let Some(declaration) = declaration {
                 let name = syntax(declaration.type_name());
-                private.insert(name.clone());
-                private_declarations.insert(name, declaration);
-            }
-            Stmt::TypeFunction(function) => {
-                private.insert(syntax(function.function_name()));
-            }
-            Stmt::ExportedTypeDeclaration(declaration) => {
-                let name = syntax(declaration.type_declaration().type_name());
-                if !exported.insert(name) {
-                    bail!("Duplicate exported type declaration.");
+                if module.aliases.insert(name, declaration.clone()).is_some() {
+                    bail!("Duplicate type declaration is ambiguous.");
                 }
             }
-            Stmt::ExportedTypeFunction(_) => {
-                bail!("Exported type functions cannot be forwarded by a type alias.")
-            }
-            _ => {}
         }
-    }
-    // Avoid collisions with both exported names and generic parameter names. No new
-    // exported names are introduced; this is only a local runtime namespace.
-    let tokens: BTreeSet<_> = ast
-        .nodes()
-        .tokens()
-        .map(|t| t.token().to_string())
-        .collect();
-    let mut namespace = "__WallyPackage".to_owned();
-    while tokens.contains(&namespace) {
-        namespace.push('_');
-    }
-    let mut result = Vec::new();
-    for statement in ast.nodes().stmts() {
-        if let Stmt::ExportedTypeDeclaration(export) = statement {
-            let declaration = export.type_declaration();
-            let name = syntax(declaration.type_name());
-            let mut parameters = String::new();
-            let mut arguments = String::new();
-            if let Some(generics) = declaration.generics() {
-                let bound = generic_names(Some(generics));
-                for parameter in generics.generics().iter() {
-                    if let Some(default) = parameter.default_type() {
-                        let mut validator = DefaultValidator {
-                            private: &private,
-                            bound: &bound,
-                            nested: Vec::new(),
-                            required: &mut required_private,
-                            error: None,
-                        };
-                        default.visit(&mut validator);
-                        if let Some(error) = validator.error {
-                            bail!("Cannot forward default for exported type {name}, {error}");
-                        }
+        // Refuse mutable import bindings rather than guessing which runtime branch
+        // assigned them. Nested writes can mutate captured top-level locals too.
+        #[derive(Default)]
+        struct Writes(BTreeSet<String>);
+        impl Visitor for Writes {
+            fn visit_assignment(&mut self, assignment: &full_moon::ast::Assignment) {
+                for variable in assignment.variables() {
+                    if let Var::Name(name) = variable {
+                        self.0.insert(syntax(name));
                     }
                 }
-                parameters = syntax(generics);
-                arguments = format!(
-                    "<{}>",
-                    generics
-                        .generics()
-                        .iter()
-                        .map(|p| syntax(p.parameter()))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
             }
-            result.push((
-                declaration.start_position().unwrap().bytes(),
-                format!("export type {name}{parameters} = {namespace}.{name}{arguments}\n"),
-            ));
+            fn visit_compound_assignment(
+                &mut self,
+                assignment: &full_moon::ast::CompoundAssignment,
+            ) {
+                if let Var::Name(name) = assignment.lhs() {
+                    self.0.insert(syntax(name));
+                }
+            }
+            fn visit_function_declaration(
+                &mut self,
+                function: &full_moon::ast::FunctionDeclaration,
+            ) {
+                if function.name().names().len() == 1 && function.name().method_name().is_none() {
+                    self.0
+                        .insert(syntax(function.name().names().iter().next().unwrap()));
+                }
+            }
+        }
+        let mut writes = Writes::default();
+        ast.nodes().visit(&mut writes);
+        module.ambiguous.extend(writes.0);
+        if module
+            .functions
+            .iter()
+            .any(|name| module.aliases.contains_key(name))
+        {
+            bail!("Ambiguous type alias and type function declarations.");
+        }
+        Ok(module)
+    }
+
+    fn bind<'a>(
+        &mut self,
+        names: impl Iterator<Item = &'a TokenReference>,
+        mut expressions: impl Iterator<Item = &'a Expression>,
+    ) {
+        for token in names {
+            let name = syntax(token);
+            let binding = (
+                token.start_position().unwrap().bytes(),
+                expressions.next().cloned(),
+            );
+            if self.bindings.insert(name.clone(), binding).is_some() {
+                self.ambiguous.insert(name);
+            }
         }
     }
-    // Defaults can use closed private aliases. Carry only their reachable type
-    // declarations, never runtime locals or additional exported names. Forward
-    // references retain the source aliases' recursion and declaration order semantics.
-    let mut copied = BTreeSet::new();
-    let mut helpers = Vec::new();
-    while let Some(name) = required_private.difference(&copied).next().cloned() {
-        let declaration = private_declarations.get(&name).with_context(|| {
-            format!("Cannot forward default using private type function {name}.")
-        })?;
-        let bound = generic_names(declaration.generics());
+}
+
+struct DefaultTypes<'a> {
+    root: &'a Path,
+    modules: BTreeMap<ModuleId, TypeModule>,
+    required: BTreeSet<AliasId>,
+}
+
+impl DefaultTypes<'_> {
+    fn module(&mut self, id: &ModuleId) -> anyhow::Result<TypeModule> {
+        if !self.modules.contains_key(id) {
+            let path = import_path(self.root, id)?;
+            let entry = resolve_path(self.root, &path, &mut BTreeSet::new())?
+                .context("Imported type module has no ModuleScript entrypoint.")?;
+            let module = TypeModule::parse(&fs::read_to_string(&entry)?)
+                .with_context(|| format!("Cannot read imported types from {}", entry.display()))?;
+            self.modules.insert(id.clone(), module);
+        }
+        Ok(self.modules[id].clone())
+    }
+
+    fn imported_alias(
+        &mut self,
+        id: &ModuleId,
+        module: &TypeModule,
+        binding: &str,
+        name: &str,
+        position: usize,
+    ) -> anyhow::Result<AliasId> {
+        if module.ambiguous.contains(binding)
+            || module.bindings.contains_key("require")
+            || module.ambiguous.contains("require")
+            || module.bindings.contains_key("script")
+            || module.ambiguous.contains("script")
+        {
+            bail!("Ambiguous or shadowed static import binding {binding}.");
+        }
+        let expression = module
+            .bindings
+            .get(binding)
+            .filter(|(declared, _)| *declared < position)
+            .and_then(|(_, expression)| expression.as_ref())
+            .with_context(|| {
+                format!("Unsupported dynamic, out-of-scope, or runtime import binding {binding}.")
+            })?;
+        let imported = import_id(self.root, id, expression)?;
+        let target = self.module(&imported)?;
+        if target.functions.contains(name) {
+            bail!("Imported type function {binding}.{name} cannot be forwarded.");
+        }
+        if !target.exported.contains(name) {
+            bail!("Imported type {binding}.{name} is not an exported alias.");
+        }
+        Ok((imported, name.to_owned()))
+    }
+
+    fn rewrite<T: VisitMut>(
+        &mut self,
+        id: &ModuleId,
+        module: &TypeModule,
+        bound: BTreeSet<String>,
+        node: T,
+        names: Option<&BTreeMap<AliasId, String>>,
+    ) -> anyhow::Result<T> {
         let mut validator = DefaultValidator {
-            private: &private,
-            bound: &bound,
+            types: self,
+            id,
+            module,
+            bound,
             nested: Vec::new(),
-            required: &mut required_private,
+            names,
             error: None,
         };
-        declaration.visit(&mut validator);
+        let node = node.visit_mut(&mut validator);
         if let Some(error) = validator.error {
-            bail!("Cannot forward private default type {name}, {error}");
+            return Err(error);
         }
-        helpers.push((
-            declaration.start_position().unwrap().bytes(),
-            format!("{}\n", syntax(*declaration)),
-        ));
-        copied.insert(name);
+        Ok(node)
     }
-    helpers.extend(result);
-    helpers.sort_by_key(|(position, _)| *position);
-    Ok(ForwardedTypes {
-        namespace,
-        aliases: helpers
-            .into_iter()
-            .map(|(_, declaration)| declaration)
-            .collect(),
-    })
+}
+
+/// Resolve children using the same staged entrypoint rules as exports. Never infer
+/// script children from a wrapper beside a project redirect or from a plain source
+/// file's siblings. Merged inline children are rejected rather than guessed.
+fn import_child(root: &Path, path: &Path, child: &str) -> anyhow::Result<PathBuf> {
+    resolve_path(root, path, &mut BTreeSet::new())?;
+    if path.is_dir() && path.join("default.project.json").is_file() {
+        return import_child(root, &path.join("default.project.json"), child);
+    }
+    if path.to_string_lossy().ends_with(".project.json") {
+        let project: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        let tree = &project["tree"];
+        if tree.get(child).is_some() {
+            bail!("Ambiguous or unsupported merged inline import mapping for {child}.");
+        }
+        let target = tree["$path"]
+            .as_str()
+            .context("Unsupported inline import mapping.")?;
+        return import_child(root, &path.parent().unwrap().join(target), child);
+    }
+    if !path.is_dir() {
+        bail!("Source file has no filesystem import child {child}.");
+    }
+    let directory = path;
+    let candidates: Vec<_> = std::iter::once(directory.join(child))
+        .chain(module_candidates(directory, child))
+        .filter(|path| path.exists())
+        .collect();
+    match candidates.as_slice() {
+        [path] => {
+            resolve_path(root, path, &mut BTreeSet::new())?;
+            Ok(path.clone())
+        }
+        [] => bail!("Static import child {child} does not exist in the staged module layout."),
+        _ => bail!("Ambiguous static import child {child}."),
+    }
+}
+
+fn import_path(root: &Path, id: &ModuleId) -> anyhow::Result<PathBuf> {
+    let mut path = root.to_path_buf();
+    let mut ancestors = BTreeSet::new();
+    for child in id {
+        let entry =
+            resolve_path(root, &path, &mut BTreeSet::new())?.unwrap_or(path.canonicalize()?);
+        if !ancestors.insert(entry) {
+            bail!("Cyclic static import module layout.");
+        }
+        path = import_child(root, &path, child)?;
+    }
+    let entry = resolve_path(root, &path, &mut BTreeSet::new())?.unwrap_or(path.canonicalize()?);
+    if ancestors.contains(&entry) {
+        bail!("Cyclic static import module layout.");
+    }
+    Ok(path)
+}
+
+fn import_id(root: &Path, id: &ModuleId, expression: &Expression) -> anyhow::Result<ModuleId> {
+    let Expression::FunctionCall(call) = expression else {
+        bail!("Unsupported dynamic import; expected a static require.");
+    };
+    if !matches!(call.prefix(), Prefix::Name(name) if syntax(name) == "require") {
+        bail!("Unsupported dynamic import; expected a static require.");
+    }
+    let suffixes: Vec<_> = call.suffixes().collect();
+    let [Suffix::Call(Call::AnonymousCall(arguments))] = suffixes.as_slice() else {
+        bail!("Unsupported dynamic import call.");
+    };
+    let argument = match arguments.as_ref() {
+        FunctionArgs::Parentheses { arguments, .. } if arguments.len() == 1 => {
+            arguments.iter().next().unwrap()
+        }
+        _ => bail!("Unsupported dynamic import arguments."),
+    };
+    let mut target = id.clone();
+    match argument {
+        Expression::Var(Var::Expression(variable)) if matches!(variable.prefix(), Prefix::Name(name) if syntax(name) == "script") =>
+        {
+            for suffix in variable.suffixes() {
+                let Suffix::Index(Index::Dot { name, .. }) = suffix else {
+                    bail!("Unsupported dynamic script import path.");
+                };
+                let child = syntax(name);
+                if child == "Parent" {
+                    target
+                        .pop()
+                        .context("Static import escapes the staged package root.")?;
+                } else {
+                    target.push(child);
+                    // Each instance lookup must exist, even when followed by Parent.
+                    import_path(root, &target)?;
+                }
+            }
+        }
+        Expression::String(token) => {
+            let TokenType::StringLiteral { literal, .. } = token.token().token_type() else {
+                unreachable!()
+            };
+            let path = literal.to_string();
+            if path.contains('\\') || path.contains('\n') {
+                bail!("Escaped static import strings are unsupported.");
+            }
+            let relative = if let Some(relative) = path.strip_prefix("@self/") {
+                relative
+            } else if path.starts_with("./") || path.starts_with("../") {
+                target
+                    .pop()
+                    .context("Static import escapes the staged package root.")?;
+                path.as_str()
+            } else {
+                bail!("Unsupported static import path; imports must stay in the staged package.");
+            };
+            for part in relative.split('/') {
+                match part {
+                    "." => {}
+                    ".." => {
+                        target
+                            .pop()
+                            .context("Static import escapes the staged package root.")?;
+                    }
+                    "" => bail!("Unsupported empty static import path component."),
+                    part => target.push(part.to_owned()),
+                }
+            }
+        }
+        _ => bail!("Unsupported dynamic import path."),
+    }
+    Ok(target)
+}
+
+fn declarations(root: &Path, entry: &Path) -> anyhow::Result<ForwardedTypes> {
+    let entry_id = Vec::new();
+    let entry = TypeModule::parse(&fs::read_to_string(entry)?)?;
+    if entry
+        .exported
+        .iter()
+        .any(|name| entry.functions.contains(name))
+    {
+        bail!("Exported type functions cannot be forwarded by a type alias.");
+    }
+    let mut types = DefaultTypes {
+        root,
+        modules: BTreeMap::from([(entry_id.clone(), entry.clone())]),
+        required: BTreeSet::new(),
+    };
+    // Discover the entire reachable closure before choosing names. Imported aliases
+    // can recurse, including across modules; each module/alias pair is visited once.
+    for name in &entry.exported {
+        let declaration = &entry.aliases[name];
+        if let Some(generics) = declaration.generics() {
+            types.rewrite(
+                &entry_id,
+                &entry,
+                generic_names(Some(generics)),
+                generics.clone(),
+                None,
+            )?;
+        }
+    }
+    let mut copied = BTreeSet::new();
+    while let Some(key) = types.required.difference(&copied).next().cloned() {
+        let module = types.module(&key.0)?;
+        let declaration = &module.aliases[&key.1];
+        types
+            .rewrite(
+                &key.0,
+                &module,
+                generic_names(declaration.generics()),
+                declaration.clone(),
+                None,
+            )
+            .with_context(|| format!("Cannot forward default dependency {}.", key.1))?;
+        copied.insert(key);
+    }
+    let mut tokens: BTreeSet<_> = types
+        .modules
+        .values()
+        .flat_map(|module| module.tokens.iter().cloned())
+        .collect();
+    let namespace = fresh_name("__WallyPackage", &mut tokens);
+    let names: BTreeMap<_, _> = copied
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            (
+                key.clone(),
+                fresh_name(&format!("__WallyType{index}"), &mut tokens),
+            )
+        })
+        .collect();
+    let mut aliases = Vec::new();
+    let mut helpers: Vec<_> = copied.iter().collect();
+    helpers.sort_by_key(|key| {
+        (
+            key.0.clone(),
+            types.modules[&key.0].aliases[&key.1]
+                .start_position()
+                .unwrap()
+                .bytes(),
+        )
+    });
+    for key in helpers {
+        let module = types.module(&key.0)?;
+        let declaration = &module.aliases[&key.1];
+        let rewritten = types.rewrite(
+            &key.0,
+            &module,
+            generic_names(declaration.generics()),
+            declaration.clone(),
+            Some(&names),
+        )?;
+        let rewritten = rewritten.with_type_name(identifier(&names[key]));
+        aliases.push(format!("{}\n", clean_syntax(rewritten)));
+    }
+    // Keep public declarations in source order. Only defaults need the copied
+    // closure; their actual bodies continue to refer to the runtime namespace.
+    let mut exports: Vec<_> = entry.exported.iter().collect();
+    exports.sort_by_key(|name| entry.aliases[*name].start_position().unwrap().bytes());
+    for name in exports {
+        let declaration = &entry.aliases[name];
+        let mut parameters = String::new();
+        let mut arguments = String::new();
+        if let Some(generics) = declaration.generics() {
+            parameters = clean_syntax(types.rewrite(
+                &entry_id,
+                &entry,
+                generic_names(Some(generics)),
+                generics.clone(),
+                Some(&names),
+            )?);
+            arguments = format!(
+                "<{}>",
+                generics
+                    .generics()
+                    .iter()
+                    .map(|parameter| syntax(parameter.parameter()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        aliases.push(format!(
+            "export type {name}{parameters} = {namespace}.{name}{arguments}\n"
+        ));
+    }
+    Ok(ForwardedTypes { namespace, aliases })
+}
+
+fn fresh_name(base: &str, tokens: &mut BTreeSet<String>) -> String {
+    let mut name = base.to_owned();
+    while !tokens.insert(name.clone()) {
+        name.push('_');
+    }
+    name
+}
+
+fn identifier(name: &str) -> TokenReference {
+    TokenReference::new(
+        Vec::new(),
+        Token::new(TokenType::Identifier {
+            identifier: name.into(),
+        }),
+        Vec::new(),
+    )
+}
+
+// AST display preserves delimiter order after replacing nodes. Strip trivia by
+// visiting tokens, since replacement tokens have no original source positions.
+fn clean_syntax<T: VisitMut + std::fmt::Display>(node: T) -> String {
+    struct Trivia;
+    impl VisitorMut for Trivia {
+        fn visit_token_reference(&mut self, token: TokenReference) -> TokenReference {
+            TokenReference::new(
+                Vec::new(),
+                token.token().clone(),
+                vec![Token::new(TokenType::spaces(1))],
+            )
+        }
+    }
+    node.visit_mut(&mut Trivia).to_string().trim().to_owned()
 }
 
 fn generic_names(generics: Option<&full_moon::ast::luau::GenericDeclaration>) -> BTreeSet<String> {
@@ -340,44 +719,115 @@ fn generic_names(generics: Option<&full_moon::ast::luau::GenericDeclaration>) ->
         .collect()
 }
 
-/// Defaults are evaluated in the link's type scope. Collect reachable private
-/// aliases, accounting for nested callback generic scopes. Module imports and typeof
-/// expressions cannot be copied without replaying runtime code, so refuse them.
-struct DefaultValidator<'a> {
-    private: &'a BTreeSet<String>,
-    bound: &'a BTreeSet<String>,
+/// Collect and then rewrite only type-reference nodes. Field names, string types,
+/// declaration binders, and callback/pack binders are never textually substituted.
+struct DefaultValidator<'a, 'root> {
+    types: &'a mut DefaultTypes<'root>,
+    id: &'a ModuleId,
+    module: &'a TypeModule,
+    bound: BTreeSet<String>,
     nested: Vec<BTreeSet<String>>,
-    required: &'a mut BTreeSet<String>,
-    error: Option<String>,
+    names: Option<&'a BTreeMap<AliasId, String>>,
+    error: Option<anyhow::Error>,
 }
 
-impl Visitor for DefaultValidator<'_> {
-    fn visit_type_info(&mut self, info: &TypeInfo) {
-        if let TypeInfo::Callback { generics, .. } = info {
+impl DefaultValidator<'_, '_> {
+    fn bound(&self, name: &str) -> bool {
+        self.bound.contains(name) || self.nested.iter().any(|scope| scope.contains(name))
+    }
+
+    fn reference(&mut self, key: AliasId) -> Option<TokenReference> {
+        self.types.required.insert(key.clone());
+        self.names.map(|names| identifier(&names[&key]))
+    }
+
+    fn rewrite_info(&mut self, mut info: TypeInfo) -> anyhow::Result<TypeInfo> {
+        match &mut info {
+            TypeInfo::Basic(token)
+            | TypeInfo::Generic { base: token, .. }
+            | TypeInfo::GenericPack { name: token, .. } => {
+                let name = syntax(token);
+                if !self.bound(&name) {
+                    if self.module.functions.contains(&name) {
+                        bail!("Type function {name} cannot be forwarded.");
+                    }
+                    if self.module.aliases.contains_key(&name) {
+                        // Entry exports already have public forwarding aliases. Their
+                        // bodies need not be closed or copied just to name a default.
+                        if !(self.id.is_empty() && self.module.exported.contains(&name)) {
+                            if let Some(replacement) = self.reference((self.id.clone(), name)) {
+                                *token = replacement;
+                            }
+                        }
+                    } else if self.module.bindings.contains_key(&name) {
+                        bail!("Type default depends on runtime binding {name}.");
+                    }
+                }
+            }
+            TypeInfo::Module {
+                module, type_info, ..
+            } => {
+                let binding = syntax(module);
+                if self.bound(&binding) {
+                    bail!("Generic binding {binding} cannot be used as an imported namespace.");
+                }
+                let name = match type_info.as_ref() {
+                    IndexedTypeInfo::Basic(name) | IndexedTypeInfo::Generic { base: name, .. } => {
+                        syntax(name)
+                    }
+                    _ => bail!("Unsupported imported type reference."),
+                };
+                let key = self.types.imported_alias(
+                    self.id,
+                    self.module,
+                    &binding,
+                    &name,
+                    module.start_position().unwrap().bytes(),
+                )?;
+                if let Some(replacement) = self.reference(key) {
+                    info = match *type_info.clone() {
+                        IndexedTypeInfo::Basic(_) => TypeInfo::Basic(replacement),
+                        IndexedTypeInfo::Generic {
+                            arrows, generics, ..
+                        } => TypeInfo::Generic {
+                            base: replacement,
+                            arrows,
+                            generics,
+                        },
+                        _ => unreachable!(),
+                    };
+                }
+            }
+            TypeInfo::Typeof { .. } => {
+                bail!("typeof defaults depend on runtime code and cannot be forwarded.")
+            }
+            _ => {}
+        }
+        Ok(info)
+    }
+}
+
+impl VisitorMut for DefaultValidator<'_, '_> {
+    fn visit_type_info(&mut self, info: TypeInfo) -> TypeInfo {
+        if let TypeInfo::Callback { generics, .. } = &info {
             self.nested.push(generic_names(generics.as_ref()));
         }
-        let name = match info {
-            TypeInfo::Basic(name) | TypeInfo::Generic { base: name, .. } => Some(syntax(name)),
-            TypeInfo::Module { .. } | TypeInfo::Typeof { .. } => {
-                self.error = Some("module-scoped or typeof defaults are unsupported.".into());
-                None
-            }
-            _ => None,
-        };
-        if let Some(name) = name {
-            if self.private.contains(&name)
-                && !self.bound.contains(&name)
-                && !self.nested.iter().any(|bound| bound.contains(&name))
-            {
-                self.required.insert(name);
+        match self.rewrite_info(info.clone()) {
+            Ok(info) => info,
+            Err(error) => {
+                if self.error.is_none() {
+                    self.error = Some(error);
+                }
+                info
             }
         }
     }
 
-    fn visit_type_info_end(&mut self, info: &TypeInfo) {
+    fn visit_type_info_end(&mut self, info: TypeInfo) -> TypeInfo {
         if matches!(info, TypeInfo::Callback { .. }) {
             self.nested.pop();
         }
+        info
     }
 }
 
@@ -416,6 +866,12 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
+    fn declarations(source: &str) -> anyhow::Result<ForwardedTypes> {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", source);
+        exports(temp.path())
+    }
+
     #[test]
     fn forwards_only_top_level_exports_and_preserves_generic_defaults_and_packs() {
         let source = r#"
@@ -441,15 +897,15 @@ return { text = text }
 
     #[test]
     fn comments_in_parameters_are_not_copied_and_nonexports_keep_old_links() {
-        let declarations =
+        let types =
             declarations("export type Box<T -- a comment\n, P...> = (T, P...) -> ()\nreturn {} ")
                 .unwrap();
-        let output = forward("return require(\"./target\")\n".into(), &declarations);
+        let output = forward("return require(\"./target\")\n".into(), &types);
         assert!(!output.contains("comment"));
         assert!(full_moon::parse(&output).is_ok(), "{}", output);
         let old = "type Package = typeof(require(game.Packages.Foo))\nreturn require(game.Packages.Foo) :: Package\n";
         assert_eq!(forward(old.into(), &ForwardedTypes::default()), old);
-        assert!(super::declarations("type Private = string\nreturn {}")
+        assert!(declarations("type Private = string\nreturn {}")
             .unwrap()
             .aliases
             .is_empty());
@@ -474,11 +930,364 @@ return { text = text }
             "return require(\"./target\")\n".into(),
             &declarations(source).unwrap(),
         );
-        assert!(output.contains("type Inner = string\n"));
-        assert!(output.contains("type Hidden < T = Inner >"));
+        assert!(
+            output.contains("type __WallyType1 = string\n"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("type __WallyType0 < T = __WallyType1 >"),
+            "{}",
+            output
+        );
         assert!(!output.contains("Imported"));
         assert_eq!(output.matches("export type ").count(), 2);
         assert!(full_moon::parse(&output).is_ok(), "{}", output);
+    }
+
+    fn generated(root: &Path) -> String {
+        let output = forward(
+            "return require(\"./target\")\n".into(),
+            &exports(root).unwrap(),
+        );
+        full_moon::parse(&output).unwrap();
+        assert_eq!(output.matches("require(").count(), 1, "{}", output);
+        output
+    }
+
+    #[test]
+    fn entry_export_defaults_keep_existing_public_aliases_without_copying_runtime_bodies() {
+        let output = forward("return require(\"./target\")\n".into(), &declarations(
+            "local value = {}\nexport type Value = typeof(value)\ntype Private = Value\nexport type Box<T = Value, U = Private> = { Value: T, Other: U }\nreturn {}"
+        ).unwrap());
+        assert!(
+            output.contains("export type Box< T = Value , U = __WallyType0 >"),
+            "{}",
+            output
+        );
+        assert!(output.contains("type __WallyType0 = Value"), "{}", output);
+        assert!(!output.contains("typeof"), "{}", output);
+        full_moon::parse(&output).unwrap();
+    }
+
+    #[test]
+    fn imported_generic_arguments_and_callback_pack_binders_are_rewritten_structurally() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Box<T = Types.Value<Types.Leaf>, P... = ...Types.Leaf> = (T, P...) -> ()\nreturn {}");
+        write(temp.path(), "Types.luau", "type P = typeof(runtime)\nexport type Leaf = string\nexport type Value<T, __WallyPackage = T> = { Value: T, Call: <P...>(P...) -> P..., Literal: \"Leaf\" }\nreturn nil");
+        let output = generated(temp.path());
+        assert!(
+            output.contains("local __WallyPackage_ = require"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("T = __WallyType1 < __WallyType0 > , P ... = ... __WallyType0"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Call : < P ... > ( P ... ) -> P ..."),
+            "{}",
+            output
+        );
+        assert!(output.contains("Literal : \"Leaf\""), "{}", output);
+        assert!(!output.contains("typeof"), "{}", output);
+    }
+
+    #[test]
+    fn fusion_like_imported_default_carries_the_exact_recursive_type_closure() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "local Types = require(script.Types)\ntype Fusion = Types.Fusion\nexport type Scope<Constructors = Fusion> = Types.Scope<Constructors>\nreturn {}");
+        write(temp.path(), "Types.luau", "type Task = () -> ()\nexport type Scope<Constructors = any> = {Task} & Constructors\ntype Constructor = <T>(Scope<unknown>, T) -> T\nexport type Fusion = { Value: Constructor, Next: Fusion? }\ntype Unreachable = typeof(runtime)\nreturn nil");
+        let output = generated(temp.path());
+        assert!(
+            output.contains("export type Scope< Constructors = __WallyType0 >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("type __WallyType0 = __WallyType2"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("type __WallyType2 = { Value : __WallyType1 , Next : __WallyType2 ? }"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains(
+                "type __WallyType3 < Constructors = any > = { __WallyType4 } & Constructors"
+            ),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("type __WallyType4 = ( ) -> ( )"),
+            "{}",
+            output
+        );
+        assert_eq!(output.matches("export type ").count(), 1);
+        // Preserve the source's one explicit any default; introduce no widening.
+        assert_eq!(output.matches("any").count(), 1, "{}", output);
+        for forbidden in ["Types .", "typeof", "Unreachable"] {
+            assert!(!output.contains(forbidden), "{}", output);
+        }
+        assert_eq!(generated(temp.path()), output);
+    }
+
+    #[test]
+    fn imported_aliases_recurse_across_modules_and_preserve_defaults_and_packs() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "const A = require(script.A)\nexport type Box<T = A.Node, P... = (A.Node, string)> = (T, P...) -> ()\nreturn {}");
+        write(temp.path(), "A.luau", "local B = require(\"./B\")\ntype Leaf = number\nexport type Node<T = Leaf, P... = ...Leaf> = { Value: T, Next: B.Node<T, P...>?, Call: (P...) -> T }\nreturn nil");
+        write(temp.path(), "B.luau", "local A = require(script.Parent.A)\nexport type Node<T, P...> = { Next: A.Node<T, P...>? }\nreturn nil");
+        let output = generated(temp.path());
+        assert!(output.contains("type __WallyType0 = number"), "{}", output);
+        assert!(
+            output.contains("type __WallyType1 < T = __WallyType0 , P ... = ... __WallyType0 >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Next : __WallyType2 < T , P ... > ?"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Next : __WallyType1 < T , P ... > ?"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("P ... = ( __WallyType1 , string )"),
+            "{}",
+            output
+        );
+        assert_eq!(output.matches("type __WallyType").count(), 3);
+    }
+
+    #[test]
+    fn private_names_do_not_capture_fields_literals_or_nested_callback_and_pack_binders() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "local Types = require(script.Types)\ntype Hidden = Types.Hidden\nexport type Box<Hidden, T = Types.Hidden, __WallyType0 = <Hidden, P...>(Hidden, P...) -> (Hidden, P...)> = T\nreturn {}");
+        write(temp.path(), "Types.luau", "type Hidden = string\nexport type Outer = number\nexport type Hidden = { Hidden: \"Hidden\", Global: Outer, Call: <Outer, P...>(Outer, P...) -> (Outer, P...), Nested: <T>(T, <Outer>(Outer) -> T) -> Outer }\nreturn nil");
+        // Distinct local and exported aliases with one spelling are ambiguous, even
+        // if an earlier parser accepted the syntax.
+        assert!(exports(temp.path()).is_err());
+        write(temp.path(), "Types.luau", "export type Outer = number\nexport type Hidden = { Hidden: \"Hidden\", Global: Outer, Call: <Outer, P...>(Outer, P...) -> (Outer, P...), Nested: <T>(T, <Outer>(Outer) -> T) -> Outer }\nreturn nil");
+        let output = generated(temp.path());
+        assert!(
+            output.contains("type __WallyType0_ = { Hidden : \"Hidden\" , Global : __WallyType1"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Call : < Outer , P ... > ( Outer , P ... ) -> ( Outer , P ... )"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Nested : < T > ( T , < Outer > ( Outer ) -> T ) -> __WallyType1"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains(
+                "export type Box< Hidden , T = __WallyType0_ , __WallyType0 = < Hidden , P ... >"
+            ),
+            "{}",
+            output
+        );
+        assert!(!output.contains("type Hidden ="), "{}", output);
+    }
+
+    #[test]
+    fn imports_follow_actual_root_and_child_project_redirects() {
+        let temp = TempDir::new().unwrap();
+        write(
+            temp.path(),
+            "default.project.json",
+            r#"{"tree":{"$path":"Source"}}"#,
+        );
+        write(temp.path(), "init.luau", "return {}");
+        write(
+            temp.path(),
+            "Types.luau",
+            "export type Value = boolean\nreturn nil",
+        );
+        write(temp.path(), "Source/init.luau", "local Types = require(\"@self/Types\")\nexport type Box<T = Types.Value> = T\nreturn {}");
+        write(
+            temp.path(),
+            "Source/Types/default.project.json",
+            r#"{"tree":{"$path":"Impl"}}"#,
+        );
+        write(
+            temp.path(),
+            "Source/Types/init.luau",
+            "export type Value = boolean\nreturn nil",
+        );
+        write(
+            temp.path(),
+            "Source/Types/Impl/init.luau",
+            "local Child = require(script.Child)\nexport type Value = Child.Value\nreturn nil",
+        );
+        write(
+            temp.path(),
+            "Source/Types/Impl/Child.lua",
+            "export type Value = string\nreturn nil",
+        );
+        let output = generated(temp.path());
+        assert!(output.contains("type __WallyType1 = string"), "{}", output);
+        assert!(!output.contains("boolean"), "{}", output);
+    }
+
+    #[test]
+    fn rejects_unsupported_reachable_imports_without_replaying_runtime_code() {
+        for binding in [
+            "local Types = require(path)",
+            "local Types = require(script:WaitForChild(\"Types\"))",
+            "local Types = require(script[\"Types\"])",
+            "local Types = require(script.Types, script.Other)",
+            "local Types = require(script.Types).Nested",
+            "local Types = runtime",
+            "local Types = require(\"other-package\")",
+            "local Types = require(\"../outside\")",
+            "local Types = require(script.Parent.Outside)",
+            "local Types = require(script.Missing.Parent.Types)",
+            "local Types = require(script.Types)\nfunction Types() end",
+            "local Types = require(script.Types)\nTypes += runtime",
+            "local Types = require(script.Types)\nTypes = require(script.Other)",
+            "local Types = require(script.Types)\nlocal Types = require(script.Types)",
+            "local require = runtime\nlocal Types = require(script.Types)",
+            "local script = runtime\nlocal Types = require(script.Types)",
+            "local Types\nif runtime then Types = require(script.Types) end",
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(
+                temp.path(),
+                "init.luau",
+                &format!("{binding}\nexport type Box<T = Types.Value> = T\nreturn {{}}"),
+            );
+            write(
+                temp.path(),
+                "Types.luau",
+                "export type Value = string\nreturn nil",
+            );
+            let error = format!("{:#}", exports(temp.path()).err().expect(binding));
+            assert!(error.contains("import"), "{}\n{}", binding, error);
+        }
+        for source in [
+            "export type Value = typeof(runtime)\nreturn nil",
+            "type function Compute() return types.number end\nexport type Value = Compute<>\nreturn nil",
+            "export type function Value() return types.number end\nreturn nil",
+            "local Runtime = {}\nexport type Value = Runtime\nreturn nil",
+            "type Value = string\nreturn nil",
+            "local Nested = require(path)\nexport type Value = Nested.Value\nreturn nil",
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Box<T = Types.Value> = T\nreturn {}");
+            write(temp.path(), "Types.luau", source);
+            assert!(exports(temp.path()).is_err(), "{}", source);
+        }
+        let temp = TempDir::new().unwrap();
+        write(
+            temp.path(),
+            "init.luau",
+            "export type Box<T = Types.Value> = T\nlocal Types = require(script.Types)\nreturn {}",
+        );
+        write(
+            temp.path(),
+            "Types.luau",
+            "export type Value = string\nreturn nil",
+        );
+        assert!(exports(temp.path()).is_err());
+    }
+
+    #[test]
+    fn imported_modules_reuse_entrypoint_validation_and_reject_ambiguous_layouts() {
+        for file in ["Types.lua", "Types/init.luau", "Types.server.luau"] {
+            let temp = TempDir::new().unwrap();
+            write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Box<T = Types.Value> = T\nreturn {}");
+            write(
+                temp.path(),
+                "Types.luau",
+                "export type Value = string\nreturn nil",
+            );
+            write(temp.path(), file, "export type Value = number\nreturn nil");
+            assert!(exports(temp.path()).is_err(), "{}", file);
+        }
+        for (path, content) in [
+            ("Types.meta.json", r#"{"className":"Script"}"#),
+            ("Types.meta.jsonc", "{}"),
+            ("default.project.json", r#"{"tree":{"$path":"init.luau"}}"#),
+            (
+                "default.project.json",
+                r#"{"tree":{"$path":"init.luau","Types":{"$path":"Other.luau"}}}"#,
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Box<T = Types.Value> = T\nreturn {}");
+            write(
+                temp.path(),
+                "Types.luau",
+                "export type Value = string\nreturn nil",
+            );
+            write(temp.path(), path, content);
+            assert!(exports(temp.path()).is_err(), "{}", path);
+        }
+    }
+
+    #[test]
+    fn imported_project_redirects_cannot_escape_or_recursively_mount_an_ancestor() {
+        for target in ["../../Outside.luau", "..", "."] {
+            let temp = TempDir::new().unwrap();
+            write(temp.path(), "Package/init.luau", "local Types = require(script.Types)\nexport type Box<T = Types.Value> = T\nreturn {}");
+            write(
+                temp.path(),
+                "Outside.luau",
+                "export type Value = string\nreturn nil",
+            );
+            write(
+                temp.path(),
+                "Package/Types/default.project.json",
+                &format!(r#"{{"tree":{{"$path":"{target}"}}}}"#),
+            );
+            let error = format!("{:#}", exports(&temp.path().join("Package")).err().unwrap());
+            assert!(
+                error.contains("escapes") || error.contains("Cyclic"),
+                "{}",
+                error
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_symlinks_cannot_escape_the_staged_package() {
+        let temp = TempDir::new().unwrap();
+        write(
+            temp.path(),
+            "Package/init.luau",
+            "local Types = require(script.Types)\nexport type Box<T = Types.Value> = T\nreturn {}",
+        );
+        write(
+            temp.path(),
+            "Outside.luau",
+            "export type Value = string\nreturn nil",
+        );
+        std::os::unix::fs::symlink(
+            temp.path().join("Outside.luau"),
+            temp.path().join("Package/Types.luau"),
+        )
+        .unwrap();
+        let error = format!("{:#}", exports(&temp.path().join("Package")).err().unwrap());
+        assert!(
+            error.contains("escapes the staged package root"),
+            "{}",
+            error
+        );
     }
 
     #[test]
