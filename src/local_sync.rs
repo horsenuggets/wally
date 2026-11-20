@@ -2,7 +2,6 @@
 //! never write destinations, and packaging rules remain owned by PackageContents.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
-use crate::install_transaction::{fingerprint, lock_installation, sync_dir};
+use crate::install_transaction::{fingerprint, lock_installation, sync_dir, InstallationLock};
 use crate::installation::package_id_file_name;
 use crate::local_packages::{
     realm_directory, source_directory, InstallMetadata, METADATA_FILE, TRANSACTION_DIR,
@@ -82,7 +81,7 @@ pub(crate) struct LocalSync {
     generation: Vec<u8>,
     mirrors: Vec<Mirror>,
     states: BTreeMap<usize, MirrorState>,
-    _lock: File,
+    _lock: InstallationLock,
 }
 
 impl LocalSync {
