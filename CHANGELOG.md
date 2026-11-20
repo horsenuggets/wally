@@ -7,6 +7,12 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## `0.3.2-horse.6.2`
+* Preserved generic defaults that reference statically imported package types, including
+  Fusion scope constructors, without adding runtime imports or widening public types.
+* Kept reachable recursive aliases, generic bindings, and type packs scoped correctly,
+  while rejecting unsupported imports without replacing a working installation.
+
 ## `0.3.2-horse.6.1`
 * Added offline `sync-local` refresh and watch support for generated local-package mirrors
   in shared, server, and development installations, without promoting generated edits

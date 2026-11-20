@@ -1425,11 +1425,22 @@ fn named_types_follow_staged_entrypoints_for_all_realms_sources_and_link_forms()
 -- export type Comment = string
 local text = [[export type Fake = string]]
 local Leaf = require("../../Leaf")
+local Types = require(script.Types)
+type Fusion = Types.Fusion
 type Private = string
+export type Scope<Constructors = Fusion> = Types.Scope<Constructors>
 export type Connection = Leaf.Connection
 export type Maid = { Clean: () -> () }
 export type Replica<T = string, U = T, P... = (number, string)> = { Data: T, Callback: (U, P...) -> () }
 return { Text = text }
+"#;
+    const IMPORTED_TYPES: &str = r#"
+export type Task = () -> ()
+export type Scope<C = unknown> = {Task} & C
+type ValueConstructor = <T>(Scope<unknown>, T) -> T
+export type Fusion = { Value: ValueConstructor, Next: Fusion? }
+type Unreachable = typeof(runtime)
+return nil
 "#;
     for registry_source in [false, true] {
         for configured in [false, true] {
@@ -1472,7 +1483,8 @@ return { Text = text }
                             "default.project.json",
                             r#"{"name":"entry","tree":{"$path":"Source/Module"}}"#,
                         )
-                        .with_file("Source/Module/init.luau", TYPES);
+                        .with_file("Source/Module/init.luau", TYPES)
+                        .with_file("Source/Module/Types.luau", IMPORTED_TYPES);
                     write(
                         root,
                         &format!("Registry/index/fixture/{name}"),
@@ -1505,6 +1517,11 @@ return { Text = text }
                         root,
                         &format!("Forks/{name}/Source/Module/init.luau"),
                         TYPES,
+                    );
+                    write(
+                        root,
+                        &format!("Forks/{name}/Source/Module/Types.luau"),
+                        IMPORTED_TYPES,
                     );
                 }
             }
@@ -1560,8 +1577,13 @@ return { Text = text }
                 {
                     typed_links += 1;
                     assert_eq!(link.matches("require(").count(), 1, "{}", path);
-                    assert_eq!(link.matches("export type ").count(), 3, "{}", path);
-                    for name in ["Connection", "Maid", "Replica"] {
+                    assert_eq!(link.matches("export type ").count(), 4, "{}", path);
+                    assert!(link.contains("export type Scope< Constructors = __WallyType0 >"));
+                    assert!(link.contains("type __WallyType0 = __WallyType1"));
+                    assert!(!link.contains("Types ."));
+                    assert!(!link.contains("typeof"));
+                    assert!(!link.contains("Unreachable"));
+                    for name in ["Connection", "Maid", "Replica", "Scope"] {
                         assert!(link.contains(&format!("export type {name}")), "{}", path);
                     }
                     assert!(link.ends_with("return __WallyPackage\n"));
@@ -1586,6 +1608,14 @@ return { Text = text }
                         .unwrap(),
                         TYPES
                     );
+                    assert_eq!(
+                        std::fs::read_to_string(
+                            root.join(&package.install_path)
+                                .join("Source/Module/Types.luau")
+                        )
+                        .unwrap(),
+                        IMPORTED_TYPES
+                    );
                 }
             }
             if !registry_source {
@@ -1597,6 +1627,45 @@ return { Text = text }
             }
         }
     }
+}
+
+#[test]
+fn imported_default_failures_abort_install_and_valid_transitive_types_recover() {
+    let project = TempProject::empty().unwrap();
+    let root = project.path();
+    root_manifest(root, "[dependencies]\nPkg='^Forks/pkg'");
+    local(root, "Forks/pkg", "pkg", "shared", "");
+    write(root, "Forks/pkg/Source/Module/init.luau", "local Types = require(script.Types)\ntype Fusion = Types.Fusion\nexport type Scope<Constructors = Fusion> = Types.Scope<Constructors>\nreturn {}\n");
+    const VALID: &str = "local Inner = require(script.Parent.Inner)\nexport type Scope<C = unknown> = {Inner.Task} & C\nexport type Fusion = { Scope: Scope<unknown>, Next: Fusion? }\nreturn nil\n";
+    write(root, "Forks/pkg/Source/Module/Types.luau", VALID);
+    write(
+        root,
+        "Forks/pkg/Source/Module/Inner.luau",
+        "export type Task = () -> ()\nreturn nil\n",
+    );
+    install(root, false).unwrap();
+    let link = std::fs::read(root.join("Packages/Pkg.luau")).unwrap();
+    let provenance = std::fs::read(root.join("wally.install.json")).unwrap();
+    for invalid in [
+        "local Inner = require(runtime)\nexport type Fusion = Inner.Value\nreturn nil\n",
+        "export type Fusion = typeof(runtime)\nreturn nil\n",
+        "local Inner = require(script.Parent.Parent.Escape)\nexport type Fusion = Inner.Value\nreturn nil\n",
+        "type function Build() return types.number end\nexport type Fusion = Build<>\nreturn nil\n",
+    ] {
+        write(root, "Forks/pkg/Source/Module/Types.luau", invalid);
+        assert!(install(root, false).is_err(), "{}", invalid);
+        assert_eq!(std::fs::read(root.join("Packages/Pkg.luau")).unwrap(), link);
+        assert_eq!(std::fs::read(root.join("wally.install.json")).unwrap(), provenance);
+        write(root, "Forks/pkg/Source/Module/Types.luau", VALID);
+        install(root, false).unwrap();
+        assert_eq!(std::fs::read(root.join("Packages/Pkg.luau")).unwrap(), link);
+        assert!(!root.join(".wally-install").exists());
+    }
+    let link = String::from_utf8(link).unwrap();
+    assert_eq!(link.matches("require(").count(), 1);
+    assert_eq!(link.matches("export type ").count(), 1);
+    assert!(link.contains("Constructors = __WallyType0"));
+    full_moon::parse(&link).unwrap();
 }
 
 #[test]
