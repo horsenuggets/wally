@@ -283,39 +283,11 @@ impl TypeModule {
                 }
             }
         }
-        // Refuse mutable import bindings rather than guessing which runtime branch
-        // assigned them. Nested writes can mutate captured top-level locals too.
-        #[derive(Default)]
-        struct Writes(BTreeSet<String>);
-        impl Visitor for Writes {
-            fn visit_assignment(&mut self, assignment: &full_moon::ast::Assignment) {
-                for variable in assignment.variables() {
-                    if let Var::Name(name) = variable {
-                        self.0.insert(syntax(name));
-                    }
-                }
-            }
-            fn visit_compound_assignment(
-                &mut self,
-                assignment: &full_moon::ast::CompoundAssignment,
-            ) {
-                if let Var::Name(name) = assignment.lhs() {
-                    self.0.insert(syntax(name));
-                }
-            }
-            fn visit_function_declaration(
-                &mut self,
-                function: &full_moon::ast::FunctionDeclaration,
-            ) {
-                if function.name().names().len() == 1 && function.name().method_name().is_none() {
-                    self.0
-                        .insert(syntax(function.name().names().iter().next().unwrap()));
-                }
-            }
-        }
-        let mut writes = Writes::default();
+        // Refuse writes to top-level bindings, including captures, but not writes
+        // to unrelated locals that happen to use the same spelling.
+        let mut writes = BindingWrites::default();
         ast.nodes().visit(&mut writes);
-        module.ambiguous.extend(writes.0);
+        module.ambiguous.extend(writes.names);
         if module
             .functions
             .iter()
@@ -340,6 +312,134 @@ impl TypeModule {
             if self.bindings.insert(name.clone(), binding).is_some() {
                 self.ambiguous.insert(name);
             }
+        }
+    }
+}
+
+/// Resolve writes in source order. Body binders are attached to the actual AST
+/// block, so function parameters and loop variables do not hide outer bindings
+/// while visiting annotations, initializers, or iterator expressions.
+#[derive(Default)]
+struct BindingWrites {
+    names: BTreeSet<String>,
+    scopes: Vec<BTreeSet<String>>,
+    body_bindings: BTreeMap<*const full_moon::ast::Block, BTreeSet<String>>,
+    repeat_blocks: BTreeSet<*const full_moon::ast::Block>,
+}
+
+impl BindingWrites {
+    fn write(&mut self, token: &TokenReference) {
+        let name = syntax(token);
+        match self.scopes.iter().rposition(|scope| scope.contains(&name)) {
+            Some(0) => {
+                self.names.insert(name);
+            }
+            // These unbound globals are also part of static import resolution.
+            None if name == "require" || name == "script" => {
+                self.names.insert(name);
+            }
+            _ => {}
+        }
+    }
+
+    fn declare<'a>(&mut self, names: impl Iterator<Item = &'a TokenReference>) {
+        self.scopes.last_mut().unwrap().extend(names.map(syntax));
+    }
+
+    fn body<'a>(
+        &mut self,
+        block: &full_moon::ast::Block,
+        names: impl Iterator<Item = &'a TokenReference>,
+    ) {
+        // Visit borrows the original AST without cloning or moving its blocks.
+        self.body_bindings
+            .entry(std::ptr::from_ref(block))
+            .or_default()
+            .extend(names.map(syntax));
+    }
+}
+
+impl Visitor for BindingWrites {
+    fn visit_block(&mut self, block: &full_moon::ast::Block) {
+        self.scopes.push(
+            self.body_bindings
+                .remove(&std::ptr::from_ref(block))
+                .unwrap_or_default(),
+        );
+    }
+
+    fn visit_block_end(&mut self, block: &full_moon::ast::Block) {
+        // A repeat body's locals remain visible in its until condition.
+        if !self.repeat_blocks.remove(&std::ptr::from_ref(block)) {
+            self.scopes.pop();
+        }
+    }
+
+    fn visit_repeat(&mut self, repeat: &full_moon::ast::Repeat) {
+        self.repeat_blocks
+            .insert(std::ptr::from_ref(repeat.block()));
+    }
+
+    fn visit_repeat_end(&mut self, _: &full_moon::ast::Repeat) {
+        self.scopes.pop();
+    }
+
+    fn visit_function_body(&mut self, function: &full_moon::ast::FunctionBody) {
+        self.body(
+            function.block(),
+            function
+                .parameters()
+                .iter()
+                .filter_map(|parameter| match parameter {
+                    full_moon::ast::Parameter::Name(name) => Some(name),
+                    _ => None,
+                }),
+        );
+    }
+
+    fn visit_numeric_for(&mut self, loop_: &full_moon::ast::NumericFor) {
+        self.body(loop_.block(), std::iter::once(loop_.index_variable()));
+    }
+
+    fn visit_generic_for(&mut self, loop_: &full_moon::ast::GenericFor) {
+        self.body(loop_.block(), loop_.names().iter());
+    }
+
+    fn visit_local_assignment_end(&mut self, assignment: &full_moon::ast::LocalAssignment) {
+        self.declare(assignment.names().iter());
+    }
+
+    fn visit_const_assignment_end(&mut self, assignment: &full_moon::ast::luau::ConstAssignment) {
+        self.declare(assignment.names().iter());
+    }
+
+    fn visit_local_function(&mut self, function: &full_moon::ast::LocalFunction) {
+        // Unlike assignment initializers, local functions can refer to themselves.
+        self.declare(std::iter::once(function.name()));
+    }
+
+    fn visit_assignment(&mut self, assignment: &full_moon::ast::Assignment) {
+        for variable in assignment.variables() {
+            if let Var::Name(name) = variable {
+                self.write(name);
+            }
+        }
+    }
+
+    fn visit_compound_assignment(&mut self, assignment: &full_moon::ast::CompoundAssignment) {
+        if let Var::Name(name) = assignment.lhs() {
+            self.write(name);
+        }
+    }
+
+    fn visit_function_declaration(&mut self, function: &full_moon::ast::FunctionDeclaration) {
+        if function.name().method_name().is_some() {
+            self.body_bindings
+                .entry(std::ptr::from_ref(function.body().block()))
+                .or_default()
+                .insert("self".to_owned());
+        } else if function.name().names().len() == 1 {
+            self.write(function.name().names().iter().next().unwrap());
         }
     }
 }
@@ -759,8 +859,6 @@ impl DefaultValidator<'_, '_> {
                                 *token = replacement;
                             }
                         }
-                    } else if self.module.bindings.contains_key(&name) {
-                        bail!("Type default depends on runtime binding {name}.");
                     }
                 }
             }
@@ -1144,6 +1242,194 @@ return { text = text }
     }
 
     #[test]
+    fn shadowed_writes_do_not_invalidate_static_imports() {
+        for statement in [
+            "local function f(Types) Types = {} end",
+            "local function f(Types) Types += runtime end",
+            "local function f(Types) function Types() end end",
+            "local f = function(Types, ...) Types = {} end",
+            "function f(Types) local function g() Types = {} end end",
+            "do local Types = {} Types = {} end",
+            "do local Types = {} Types += runtime end",
+            "do local Types = {} function Types() end end",
+            "do const Types = {} local function f() Types = {} end end",
+            "do local function Types() Types = {} end end",
+            "do local function Types() end function Types() end end",
+            "do local Types = {} local Types = (function() Types = {} end)() end",
+            "for Types = 1, 2 do Types = 3 end",
+            "for Types = 1, 2 do Types += runtime end",
+            "for Types = 1, 2 do function Types() end end",
+            "for _, Types in iterator() do Types = {} end",
+            "for Types, _ in iterator() do Types += runtime end",
+            "for Types in iterator() do local function f() Types = {} end end",
+            "if runtime then local Types = {} Types = {} else local Types = {} function Types() end end",
+            "while runtime do local Types = {} Types = {} end",
+            "repeat local Types = {} until (function() Types = {} return true end)()",
+            "do local Types = {} repeat until (function() Types = {} return true end)() end",
+            "local function f() do local Types = {} Types = {} end end",
+            "function Types.method() end function Types:method() end",
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(
+                temp.path(),
+                "init.luau",
+                &format!("local Types = require(script.Types)\n{statement}\nexport type Box<T = Types.Value> = T\nreturn {{}}"),
+            );
+            write(temp.path(), "Types.luau", "export type Value = string\nreturn nil");
+            let types =
+                exports(temp.path()).unwrap_or_else(|error| panic!("{}\n{:#}", statement, error));
+            let output = forward("return require(\"./target\")\n".into(), &types);
+            assert!(output.contains("type __WallyType0 = string"), "{}\n{}", statement, output);
+            full_moon::parse(&output).unwrap();
+        }
+    }
+
+    #[test]
+    fn captured_writes_including_initializers_and_iterators_invalidate_imports() {
+        for statement in [
+            "local function f() Types = {} end",
+            "local function f() Types += runtime end",
+            "local function f() function Types() end end",
+            "local function f() local function g() Types = {} end end",
+            "local function f() Types = {} local Types = {} end",
+            "local function f() Types += runtime const Types = {} end",
+            "local function f() function Types() end local function Types() end end",
+            "do Types = {} local Types = {} end",
+            "do Types = {} end",
+            "do local Types = {} end Types = {}",
+            "if runtime then local Types = {} else Types = {} end",
+            "repeat local Types = {} until true Types = {}",
+            "repeat until (function() Types = {} return true end)()",
+            "do local Types = (function() Types = {} end)() end",
+            "do const Types = (function() Types = {} end)() end",
+            "do local Other, Types = (function() Types = {} end)(), {} end",
+            "local function f() local Types = function() Types = {} end end",
+            "for Types = (function() Types = {} return 1 end)(), 2 do end",
+            "for Types = 1, (function() Types = {} return 2 end)() do end",
+            "for Types = 1, 2, (function() Types = {} return 1 end)() do end",
+            "for Types in iterator(function() Types = {} end) do end",
+            "for _, Types in (function() Types = {} return iterator() end)() do end",
+            "for Other in iterator() do Types = {} end",
+            "for Types = 1, 2 do end Types = {}",
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(
+                temp.path(),
+                "init.luau",
+                &format!("local Types = require(script.Types)\n{statement}\nexport type Box<T = Types.Value> = T\nreturn {{}}"),
+            );
+            write(
+                temp.path(),
+                "Types.luau",
+                "export type Value = string\nreturn nil",
+            );
+            let error = format!("{:#}", exports(temp.path()).err().expect(statement));
+            assert!(
+                error.contains("Ambiguous or shadowed static import binding Types"),
+                "{}\n{}",
+                statement,
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn writes_resolve_declaration_order_and_implicit_method_parameters() {
+        let module = TypeModule::parse(
+            "Types = {}\nlocal function before() Types = {} end\nlocal Types = require(script.Types)\nlocal self = require(script.Types)\nfunction object:method() self = {} end\nlocal function f() local Types = {} Types = {} end",
+        ).unwrap();
+        assert!(module.ambiguous.is_empty(), "{:?}", module.ambiguous);
+        let module = TypeModule::parse(
+            "local Types = require(script.Types)\nlocal Types = (function() Types = {} end)()",
+        )
+        .unwrap();
+        assert!(module.ambiguous.contains("Types"));
+        for name in ["require", "script"] {
+            for statement in [
+                format!("local function f({name}) {name} = runtime end"),
+                format!("do local {name} = runtime {name} += runtime end"),
+                format!("for {name} in iterator() do function {name}() end end"),
+            ] {
+                let module = TypeModule::parse(&statement).unwrap();
+                assert!(!module.ambiguous.contains(name), "{}", statement);
+            }
+            let module =
+                TypeModule::parse(&format!("local function f() {name} = runtime end")).unwrap();
+            assert!(module.ambiguous.contains(name));
+        }
+    }
+
+    #[test]
+    fn unqualified_type_defaults_ignore_same_named_value_bindings() {
+        for (name, value) in [
+            ("string", "string"),
+            ("Vector3", "Vector3"),
+            ("Runtime", "{}"),
+        ] {
+            let output = forward(
+                "return require(\"./target\")\n".into(),
+                &declarations(&format!(
+                    "local {name} = {value}\nexport type Box<T = {name}> = T\nreturn {{}}"
+                ))
+                .unwrap(),
+            );
+            assert!(
+                output.contains(&format!("export type Box< T = {name} >")),
+                "{}",
+                output
+            );
+            full_moon::parse(&output).unwrap();
+
+            let temp = TempDir::new().unwrap();
+            write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Box<T = Types.Value> = T\nreturn {}");
+            write(
+                temp.path(),
+                "Types.luau",
+                &format!(
+                    "local {name} = {value}\nexport type Value = {{ Value: {name} }}\nreturn nil"
+                ),
+            );
+            let output = generated(temp.path());
+            assert!(
+                output.contains(&format!("type __WallyType0 = {{ Value : {name} }}")),
+                "{}",
+                output
+            );
+        }
+    }
+
+    #[test]
+    fn type_alias_and_generic_scopes_still_precede_unqualified_global_types() {
+        let output = forward(
+            "return require(\"./target\")\n".into(),
+            &declarations("local string = string\ntype string = number\nexport type Box<T = string> = T\nexport type Generic<string, T = string> = T\nexport type Callback<T = <string>(string) -> string> = T\nreturn {}").unwrap(),
+        );
+        assert!(output.contains("type __WallyType0 = number"), "{}", output);
+        assert!(
+            output.contains("export type Box< T = __WallyType0 >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("export type Generic< string , T = string >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("< string > ( string ) -> string"),
+            "{}",
+            output
+        );
+        full_moon::parse(&output).unwrap();
+        for source in [
+            "local string = string\nexport type Box<T = typeof(string)> = T\nreturn {}",
+            "local Compute = {}\ntype function Compute() return types.string end\nexport type Box<T = Compute<>> = T\nreturn {}",
+        ] {
+            assert!(declarations(source).is_err(), "{}", source);
+        }
+    }
+
+    #[test]
     fn rejects_unsupported_reachable_imports_without_replaying_runtime_code() {
         for binding in [
             "local Types = require(path)",
@@ -1182,7 +1468,6 @@ return { text = text }
             "export type Value = typeof(runtime)\nreturn nil",
             "type function Compute() return types.number end\nexport type Value = Compute<>\nreturn nil",
             "export type function Value() return types.number end\nreturn nil",
-            "local Runtime = {}\nexport type Value = Runtime\nreturn nil",
             "type Value = string\nreturn nil",
             "local Nested = require(path)\nexport type Value = Nested.Value\nreturn nil",
         ] {
