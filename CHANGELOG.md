@@ -12,6 +12,10 @@
   Fusion scope constructors, without adding runtime imports or widening public types.
 * Kept reachable recursive aliases, generic bindings, and type packs scoped correctly,
   while rejecting unsupported imports without replacing a working installation.
+* Shared cached parsed modules across alias lookups to avoid repeatedly copying complete
+  declaration maps during installation.
+* Released installation locks explicitly before closing their descriptors so concurrently
+  spawned children cannot temporarily retain completed install or mirror ownership.
 
 ## `0.3.2-horse.6.1`
 * Added offline `sync-local` refresh and watch support for generated local-package mirrors

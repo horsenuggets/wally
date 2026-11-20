@@ -25,10 +25,20 @@ const SURFACES: [&str; 5] = [
 ];
 const MARKER: &[u8] = b"Wally install transaction version 1\n";
 
+pub(crate) struct InstallationLock(File);
+
+impl Drop for InstallationLock {
+    fn drop(&mut self) {
+        // A concurrent fork can retain the open file description until exec even
+        // with close-on-exec set. Release ownership before closing our descriptor.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 pub(crate) struct InstallTransaction {
     root: PathBuf,
     directory: PathBuf,
-    _lock: File,
+    _lock: InstallationLock,
     originals: BTreeMap<String, Option<String>>,
 }
 
@@ -44,7 +54,7 @@ struct Entry {
     new: Option<String>,
 }
 
-pub(crate) fn lock_installation(root: &Path) -> anyhow::Result<File> {
+pub(crate) fn lock_installation(root: &Path) -> anyhow::Result<InstallationLock> {
     let lock_path = root.join(INSTALL_LOCK_FILE);
     if let Ok(metadata) = fs_err::symlink_metadata(&lock_path) {
         ensure!(
@@ -61,7 +71,7 @@ pub(crate) fn lock_installation(root: &Path) -> anyhow::Result<File> {
     lock.try_lock_exclusive().context(
         "Another Wally installation or local mirror watcher is running for this project.",
     )?;
-    Ok(lock)
+    Ok(InstallationLock(lock))
 }
 
 impl InstallTransaction {
@@ -457,6 +467,21 @@ pub(crate) fn sync_dir(path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn installation_lock_releases_before_a_duplicated_descriptor_closes() {
+        let temp = TempDir::new().unwrap();
+        let owner = lock_installation(temp.path()).unwrap();
+        let inherited = owner.0.try_clone().unwrap();
+        assert!(lock_installation(temp.path()).is_err());
+        drop(owner);
+        let replacement = lock_installation(temp.path()).unwrap();
+        drop(inherited);
+        assert!(lock_installation(temp.path()).is_err());
+        drop(replacement);
+        assert!(lock_installation(temp.path()).is_ok());
+    }
 
     fn surface(root: &Path, name: &str, contents: &str) {
         if name.ends_with(".json") || name.ends_with(".lock") {
