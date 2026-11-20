@@ -10,7 +10,12 @@ use anyhow::{bail, Context};
 use fs_err as fs;
 use full_moon::{
     ast::{
-        luau::{IndexedTypeInfo, TypeDeclaration, TypeInfo},
+        luau::{
+            GenericDeclarationParameter, GenericParameterInfo, IndexedTypeInfo, TypeDeclaration,
+            TypeInfo,
+        },
+        punctuated::{Pair, Punctuated},
+        span::ContainedSpan,
         Call, Expression, FunctionArgs, Index, Prefix, Stmt, Suffix, Var,
     },
     node::Node,
@@ -444,10 +449,23 @@ impl Visitor for BindingWrites {
     }
 }
 
+// Source positions distinguish applications even when their text or binders match.
+type ApplicationId = (ModuleId, usize);
+type Captures = BTreeSet<(bool, String)>;
+
 struct DefaultTypes<'a> {
     root: &'a Path,
     modules: BTreeMap<ModuleId, TypeModule>,
     required: BTreeSet<AliasId>,
+    defaults: BTreeSet<AliasId>,
+    applications: BTreeMap<ApplicationId, Captures>,
+    application_bodies: BTreeMap<ApplicationId, TypeInfo>,
+}
+
+struct DefaultNames {
+    aliases: BTreeMap<AliasId, String>,
+    defaults: BTreeMap<AliasId, String>,
+    applications: BTreeMap<ApplicationId, String>,
 }
 
 impl DefaultTypes<'_> {
@@ -502,16 +520,16 @@ impl DefaultTypes<'_> {
         &mut self,
         id: &ModuleId,
         module: &TypeModule,
-        bound: BTreeSet<String>,
         node: T,
-        names: Option<&BTreeMap<AliasId, String>>,
+        names: Option<&DefaultNames>,
     ) -> anyhow::Result<T> {
         let mut validator = DefaultValidator {
             types: self,
             id,
             module,
-            bound,
-            nested: Vec::new(),
+            scopes: vec![GenericBindings::default()],
+            default_depth: 0,
+            applications: Vec::new(),
             names,
             error: None,
         };
@@ -665,19 +683,16 @@ fn declarations(root: &Path, entry: &Path) -> anyhow::Result<ForwardedTypes> {
         root,
         modules: BTreeMap::from([(entry_id.clone(), entry.clone())]),
         required: BTreeSet::new(),
+        defaults: BTreeSet::new(),
+        applications: BTreeMap::new(),
+        application_bodies: BTreeMap::new(),
     };
     // Discover the entire reachable closure before choosing names. Imported aliases
     // can recurse, including across modules; each module/alias pair is visited once.
     for name in &entry.exported {
         let declaration = &entry.aliases[name];
         if let Some(generics) = declaration.generics() {
-            types.rewrite(
-                &entry_id,
-                &entry,
-                generic_names(Some(generics)),
-                generics.clone(),
-                None,
-            )?;
+            types.rewrite(&entry_id, &entry, generics.clone(), None)?;
         }
     }
     let mut copied = BTreeSet::new();
@@ -685,13 +700,7 @@ fn declarations(root: &Path, entry: &Path) -> anyhow::Result<ForwardedTypes> {
         let module = types.module(&key.0)?;
         let declaration = &module.aliases[&key.1];
         types
-            .rewrite(
-                &key.0,
-                &module,
-                generic_names(declaration.generics()),
-                declaration.clone(),
-                None,
-            )
+            .rewrite(&key.0, &module, declaration.clone(), None)
             .with_context(|| format!("Cannot forward default dependency {}.", key.1))?;
         copied.insert(key);
     }
@@ -701,16 +710,43 @@ fn declarations(root: &Path, entry: &Path) -> anyhow::Result<ForwardedTypes> {
         .flat_map(|module| module.tokens.iter().cloned())
         .collect();
     let namespace = fresh_name("__WallyPackage", &mut tokens);
-    let names: BTreeMap<_, _> = copied
-        .iter()
-        .enumerate()
-        .map(|(index, key)| {
-            (
-                key.clone(),
-                fresh_name(&format!("__WallyType{index}"), &mut tokens),
-            )
-        })
-        .collect();
+    let names = DefaultNames {
+        aliases: copied
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                (
+                    key.clone(),
+                    fresh_name(&format!("__WallyType{index}"), &mut tokens),
+                )
+            })
+            .collect(),
+        defaults: types
+            .defaults
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                (
+                    key.clone(),
+                    fresh_name(&format!("__WallyDefault{index}"), &mut tokens),
+                )
+            })
+            .collect(),
+        applications: types
+            .applications
+            .keys()
+            .enumerate()
+            .map(|(index, key)| {
+                (
+                    key.clone(),
+                    fresh_name(
+                        &format!("__WallyDefault{}", types.defaults.len() + index),
+                        &mut tokens,
+                    ),
+                )
+            })
+            .collect(),
+    };
     let mut aliases = Vec::new();
     let mut helpers: Vec<_> = copied.iter().collect();
     helpers.sort_by_key(|key| {
@@ -725,32 +761,22 @@ fn declarations(root: &Path, entry: &Path) -> anyhow::Result<ForwardedTypes> {
     for key in helpers {
         let module = types.module(&key.0)?;
         let declaration = &module.aliases[&key.1];
-        let rewritten = types.rewrite(
-            &key.0,
-            &module,
-            generic_names(declaration.generics()),
-            declaration.clone(),
-            Some(&names),
-        )?;
-        let rewritten = rewritten.with_type_name(identifier(&names[key]));
+        let rewritten = types.rewrite(&key.0, &module, declaration.clone(), Some(&names))?;
+        let rewritten = rewritten.with_type_name(identifier(&names.aliases[key]));
         aliases.push(format!("{}\n", clean_syntax(rewritten)));
     }
     // Keep public declarations in source order. Only defaults need the copied
     // closure; their actual bodies continue to refer to the runtime namespace.
     let mut exports: Vec<_> = entry.exported.iter().collect();
     exports.sort_by_key(|name| entry.aliases[*name].start_position().unwrap().bytes());
+    let mut public_aliases = Vec::new();
     for name in exports {
         let declaration = &entry.aliases[name];
         let mut parameters = String::new();
         let mut arguments = String::new();
         if let Some(generics) = declaration.generics() {
-            parameters = clean_syntax(types.rewrite(
-                &entry_id,
-                &entry,
-                generic_names(Some(generics)),
-                generics.clone(),
-                Some(&names),
-            )?);
+            parameters =
+                clean_syntax(types.rewrite(&entry_id, &entry, generics.clone(), Some(&names))?);
             arguments = format!(
                 "<{}>",
                 generics
@@ -761,10 +787,35 @@ fn declarations(root: &Path, entry: &Path) -> anyhow::Result<ForwardedTypes> {
                     .join(", ")
             );
         }
-        aliases.push(format!(
+        public_aliases.push(format!(
             "export type {name}{parameters} = {namespace}.{name}{arguments}\n"
         ));
     }
+    // Luau prototypes defaults before checking bodies. Defer instantiation of
+    // copied generics, including entire explicit applications, into alias bodies.
+    for (key, name) in &names.defaults {
+        aliases.push(format!("type {name} = {}\n", names.aliases[key]));
+    }
+    for (key, name) in &names.applications {
+        let parameters = types.applications[key]
+            .iter()
+            .map(|(pack, name)| format!("{name}{}", if *pack { "..." } else { "" }))
+            .collect::<Vec<_>>();
+        let parameters = if parameters.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", parameters.join(", "))
+        };
+        let body = types
+            .application_bodies
+            .remove(key)
+            .context("Missing deferred default application body.")?;
+        aliases.push(format!(
+            "type {name}{parameters} = {}\n",
+            clean_syntax(body)
+        ));
+    }
+    aliases.extend(public_aliases);
     Ok(ForwardedTypes { namespace, aliases })
 }
 
@@ -802,21 +853,24 @@ fn clean_syntax<T: VisitMut + std::fmt::Display>(node: T) -> String {
     node.visit_mut(&mut Trivia).to_string().trim().to_owned()
 }
 
-fn generic_names(generics: Option<&full_moon::ast::luau::GenericDeclaration>) -> BTreeSet<String> {
-    generics
-        .into_iter()
-        .flat_map(|g| g.generics().iter())
-        .map(|parameter| {
-            // The AST separates the parameter name from a pack's ellipsis.
-            parameter
-                .parameter()
-                .tokens()
-                .next()
-                .unwrap()
-                .token()
-                .to_string()
-        })
-        .collect()
+#[derive(Default)]
+struct GenericBindings {
+    types: BTreeSet<String>,
+    packs: BTreeSet<String>,
+}
+
+impl GenericBindings {
+    fn declare(&mut self, parameter: &GenericParameterInfo) {
+        match parameter {
+            GenericParameterInfo::Name(name) => {
+                self.types.insert(syntax(name));
+            }
+            GenericParameterInfo::Variadic { name, .. } => {
+                self.packs.insert(syntax(name));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Collect and then rewrite only type-reference nodes. Field names, string types,
@@ -825,29 +879,52 @@ struct DefaultValidator<'a, 'root> {
     types: &'a mut DefaultTypes<'root>,
     id: &'a ModuleId,
     module: &'a TypeModule,
-    bound: BTreeSet<String>,
-    nested: Vec<BTreeSet<String>>,
-    names: Option<&'a BTreeMap<AliasId, String>>,
+    scopes: Vec<GenericBindings>,
+    default_depth: usize,
+    applications: Vec<Option<(ApplicationId, AliasId)>>,
+    names: Option<&'a DefaultNames>,
     error: Option<anyhow::Error>,
 }
 
 impl DefaultValidator<'_, '_> {
-    fn bound(&self, name: &str) -> bool {
-        self.bound.contains(name) || self.nested.iter().any(|scope| scope.contains(name))
+    fn bound(&self, name: &str, pack: bool) -> bool {
+        self.scopes.iter().any(|scope| {
+            if pack {
+                scope.packs.contains(name)
+            } else {
+                scope.types.contains(name)
+            }
+        })
     }
 
-    fn reference(&mut self, key: AliasId) -> Option<TokenReference> {
+    fn reference(&mut self, key: AliasId, bare: bool) -> Option<TokenReference> {
         self.types.required.insert(key.clone());
-        self.names.map(|names| identifier(&names[&key]))
+        let defaulted = bare
+            && self.types.modules[&key.0].aliases[&key.1]
+                .generics()
+                .is_some();
+        if defaulted {
+            self.types.defaults.insert(key.clone());
+        }
+        self.names.map(|names| {
+            identifier(if defaulted {
+                &names.defaults[&key]
+            } else {
+                &names.aliases[&key]
+            })
+        })
     }
 
-    fn rewrite_info(&mut self, mut info: TypeInfo) -> anyhow::Result<TypeInfo> {
+    fn rewrite_info(&mut self, mut info: TypeInfo) -> anyhow::Result<(TypeInfo, Option<AliasId>)> {
+        let mut dependency = None;
+        let pack = matches!(info, TypeInfo::GenericPack { .. });
+        let bare = matches!(info, TypeInfo::Basic(_));
         match &mut info {
             TypeInfo::Basic(token)
             | TypeInfo::Generic { base: token, .. }
             | TypeInfo::GenericPack { name: token, .. } => {
                 let name = syntax(token);
-                if !self.bound(&name) {
+                if !self.bound(&name, pack) {
                     if self.module.functions.contains(&name) {
                         bail!("Type function {name} cannot be forwarded.");
                     }
@@ -855,10 +932,18 @@ impl DefaultValidator<'_, '_> {
                         // Entry exports already have public forwarding aliases. Their
                         // bodies need not be closed or copied just to name a default.
                         if !(self.id.is_empty() && self.module.exported.contains(&name)) {
-                            if let Some(replacement) = self.reference((self.id.clone(), name)) {
+                            let key = (self.id.clone(), name);
+                            if let Some(replacement) = self.reference(key.clone(), bare) {
                                 *token = replacement;
                             }
+                            dependency = Some(key);
                         }
+                    } else if !self.id.is_empty()
+                        && self.types.modules[&ModuleId::new()]
+                            .exported
+                            .contains(&name)
+                    {
+                        bail!("Free imported type {name} would be captured by entrypoint export {name}; rename the entrypoint export or bind the type explicitly in its source module.");
                     }
                 }
             }
@@ -866,9 +951,6 @@ impl DefaultValidator<'_, '_> {
                 module, type_info, ..
             } => {
                 let binding = syntax(module);
-                if self.bound(&binding) {
-                    bail!("Generic binding {binding} cannot be used as an imported namespace.");
-                }
                 let name = match type_info.as_ref() {
                     IndexedTypeInfo::Basic(name) | IndexedTypeInfo::Generic { base: name, .. } => {
                         syntax(name)
@@ -882,7 +964,10 @@ impl DefaultValidator<'_, '_> {
                     &name,
                     module.start_position().unwrap().bytes(),
                 )?;
-                if let Some(replacement) = self.reference(key) {
+                if let Some(replacement) = self.reference(
+                    key.clone(),
+                    matches!(type_info.as_ref(), IndexedTypeInfo::Basic(_)),
+                ) {
                     info = match *type_info.clone() {
                         IndexedTypeInfo::Basic(_) => TypeInfo::Basic(replacement),
                         IndexedTypeInfo::Generic {
@@ -895,24 +980,137 @@ impl DefaultValidator<'_, '_> {
                         _ => unreachable!(),
                     };
                 }
+                dependency = Some(key);
             }
             TypeInfo::Typeof { .. } => {
                 bail!("typeof defaults depend on runtime code and cannot be forwarded.")
             }
             _ => {}
         }
-        Ok(info)
+        Ok((info, dependency))
+    }
+
+    fn defer_application(
+        &mut self,
+        key: ApplicationId,
+        target: AliasId,
+        mut info: TypeInfo,
+    ) -> anyhow::Result<TypeInfo> {
+        // Validate pack grouping during discovery, before generating any output.
+        normalize_application(&mut info, &self.types.modules[&target.0].aliases[&target.1])?;
+        let Some(names) = self.names else {
+            let mut captures = CaptureReferences {
+                available: self
+                    .scopes
+                    .iter()
+                    .flat_map(|scope| {
+                        scope
+                            .types
+                            .iter()
+                            .map(|name| (false, name.clone()))
+                            .chain(scope.packs.iter().map(|name| (true, name.clone())))
+                    })
+                    .collect(),
+                scopes: vec![GenericBindings::default()],
+                used: BTreeSet::new(),
+            };
+            info.visit(&mut captures);
+            for (pack, name) in &captures.used {
+                if captures.used.contains(&(!pack, name.clone())) {
+                    bail!("Cannot defer generic default application capturing both type {name} and pack {name}...; use distinct type and pack binder names in the source.");
+                }
+                if self.scopes.iter().skip(1).any(|scope| {
+                    if *pack {
+                        scope.packs.contains(name)
+                    } else {
+                        scope.types.contains(name)
+                    }
+                }) {
+                    bail!("Cannot defer generic default application capturing callback-local generic {name}; move the application outside the generic callback or into a named source alias. The legacy analyzer cannot instantiate this helper inside a generic callback default.");
+                }
+            }
+            self.types.applications.insert(key, captures.used);
+            return Ok(info);
+        };
+        // Introduce fresh helper binders with the original spellings. The legacy
+        // analyzer requires matching names when instantiating these in defaults;
+        // alpha-renaming them incorrectly reports recursive type instantiation.
+        let name = &names.applications[&key];
+        let arguments = self.types.applications[&key]
+            .iter()
+            .map(|(pack, name)| {
+                if *pack {
+                    TypeInfo::GenericPack {
+                        name: identifier(name),
+                        ellipsis: TokenReference::symbol("...").unwrap(),
+                    }
+                } else {
+                    TypeInfo::Basic(identifier(name))
+                }
+            })
+            .collect::<Vec<_>>();
+        self.types.application_bodies.insert(key, info);
+        Ok(if arguments.is_empty() {
+            TypeInfo::Basic(identifier(name))
+        } else {
+            TypeInfo::Generic {
+                base: identifier(name),
+                arrows: delimiters("<", ">"),
+                generics: punctuated(arguments),
+            }
+        })
     }
 }
 
 impl VisitorMut for DefaultValidator<'_, '_> {
-    fn visit_type_info(&mut self, info: TypeInfo) -> TypeInfo {
-        if let TypeInfo::Callback { generics, .. } = &info {
-            self.nested.push(generic_names(generics.as_ref()));
+    fn visit_generic_declaration_parameter(
+        &mut self,
+        parameter: GenericDeclarationParameter,
+    ) -> GenericDeclarationParameter {
+        if parameter.default_type().is_some() {
+            self.default_depth += 1;
         }
+        parameter
+    }
+
+    fn visit_generic_declaration_parameter_end(
+        &mut self,
+        parameter: GenericDeclarationParameter,
+    ) -> GenericDeclarationParameter {
+        if parameter.default_type().is_some() {
+            self.default_depth -= 1;
+        }
+        // Luau resolves a default before introducing its own binder. Visiting in
+        // AST order also leaves later parameters out of scope until their turn.
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .declare(parameter.parameter());
+        parameter
+    }
+
+    fn visit_type_info(&mut self, info: TypeInfo) -> TypeInfo {
+        if matches!(info, TypeInfo::Callback { .. }) {
+            self.scopes.push(GenericBindings::default());
+        }
+        let explicit = matches!(&info, TypeInfo::Generic { .. })
+            || matches!(&info, TypeInfo::Module { type_info, .. }
+                if matches!(type_info.as_ref(), IndexedTypeInfo::Generic { .. }));
         match self.rewrite_info(info.clone()) {
-            Ok(info) => info,
+            Ok((rewritten, dependency)) => {
+                let application = dependency
+                    .filter(|_| explicit && self.default_depth > 0)
+                    .map(|target| {
+                        (
+                            (self.id.clone(), info.start_position().unwrap().bytes()),
+                            target,
+                        )
+                    });
+                self.applications.push(application);
+                rewritten
+            }
             Err(error) => {
+                self.applications.push(None);
                 if self.error.is_none() {
                     self.error = Some(error);
                 }
@@ -921,11 +1119,142 @@ impl VisitorMut for DefaultValidator<'_, '_> {
         }
     }
 
-    fn visit_type_info_end(&mut self, info: TypeInfo) -> TypeInfo {
+    fn visit_type_info_end(&mut self, mut info: TypeInfo) -> TypeInfo {
+        if let Some((key, target)) = self.applications.pop().unwrap() {
+            match self.defer_application(key, target, info.clone()) {
+                Ok(rewritten) => info = rewritten,
+                Err(error) => {
+                    if self.error.is_none() {
+                        self.error = Some(error);
+                    }
+                }
+            }
+        }
         if matches!(info, TypeInfo::Callback { .. }) {
-            self.nested.pop();
+            self.scopes.pop();
         }
         info
+    }
+}
+
+fn delimiters(open: &str, close: &str) -> ContainedSpan {
+    ContainedSpan::new(
+        TokenReference::symbol(open).unwrap(),
+        TokenReference::symbol(close).unwrap(),
+    )
+}
+
+fn punctuated(items: Vec<TypeInfo>) -> Punctuated<TypeInfo> {
+    let len = items.len();
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            Pair::new(
+                item,
+                (index + 1 < len).then(|| TokenReference::symbol(",").unwrap()),
+            )
+        })
+        .collect()
+}
+
+/// Only the sole trailing target pack has an unambiguous flattening rule. A tuple
+/// supplies that pack as one argument to the legacy analyzer in a helper body.
+fn normalize_application(info: &mut TypeInfo, target: &TypeDeclaration) -> anyhow::Result<()> {
+    let arguments = match info {
+        TypeInfo::Generic { generics, .. } => generics,
+        TypeInfo::Module { type_info, .. } => match type_info.as_mut() {
+            IndexedTypeInfo::Generic { generics, .. } => generics,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let Some(parameters) = target.generics() else {
+        return Ok(());
+    };
+    let parameters: Vec<_> = parameters.generics().iter().collect();
+    let fixed = parameters
+        .iter()
+        .take_while(|parameter| matches!(parameter.parameter(), GenericParameterInfo::Name(_)))
+        .count();
+    let packs = parameters.len() - fixed;
+    if packs == 0 || arguments.len() <= fixed {
+        return Ok(());
+    }
+    let mut items: Vec<_> = arguments.iter().cloned().collect();
+    let is_pack = |info: &TypeInfo| {
+        matches!(
+            info,
+            TypeInfo::GenericPack { .. }
+                | TypeInfo::Tuple { .. }
+                | TypeInfo::Variadic { .. }
+                | TypeInfo::VariadicPack { .. }
+        )
+    };
+    let tail = &items[fixed..];
+    if items[..fixed].iter().any(is_pack)
+        || (packs > 1 && (tail.len() > packs || tail.iter().any(|info| !is_pack(info))))
+        || (packs == 1 && tail[..tail.len() - 1].iter().any(is_pack))
+    {
+        bail!("Cannot defer generic default application of {} with ambiguous type-pack arguments; use one explicit tuple per target pack, or a named source alias for the application.", syntax(target.type_name()));
+    }
+    if packs == 1 && tail.len() > 1 {
+        let tail = items.split_off(fixed);
+        items.push(TypeInfo::Tuple {
+            parentheses: delimiters("(", ")"),
+            types: punctuated(tail),
+        });
+        *arguments = punctuated(items);
+    }
+    Ok(())
+}
+
+/// Find only free references to binders visible at an application. Traversing
+/// callback declarations in order also handles same-name nested scopes.
+struct CaptureReferences {
+    available: Captures,
+    scopes: Vec<GenericBindings>,
+    used: Captures,
+}
+
+impl Visitor for CaptureReferences {
+    fn visit_generic_declaration_parameter_end(&mut self, parameter: &GenericDeclarationParameter) {
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .declare(parameter.parameter());
+    }
+
+    fn visit_type_info(&mut self, info: &TypeInfo) {
+        if matches!(info, TypeInfo::Callback { .. }) {
+            self.scopes.push(GenericBindings::default());
+        }
+        let pack = matches!(info, TypeInfo::GenericPack { .. });
+        let token = match info {
+            TypeInfo::Basic(token)
+            | TypeInfo::Generic { base: token, .. }
+            | TypeInfo::VariadicPack { name: token, .. }
+            | TypeInfo::GenericPack { name: token, .. } => token,
+            _ => return,
+        };
+        let name = syntax(token);
+        let key = (pack, name.clone());
+        let local = self.scopes.iter().any(|scope| {
+            if pack {
+                scope.packs.contains(&name)
+            } else {
+                scope.types.contains(&name)
+            }
+        });
+        if !local && self.available.contains(&key) {
+            self.used.insert(key);
+        }
+    }
+
+    fn visit_type_info_end(&mut self, info: &TypeInfo) {
+        if matches!(info, TypeInfo::Callback { .. }) {
+            self.scopes.pop();
+        }
     }
 }
 
@@ -1080,7 +1409,7 @@ return { text = text }
             output
         );
         assert!(
-            output.contains("T = __WallyType1 < __WallyType0 > , P ... = ... __WallyType0"),
+            output.contains("T = __WallyDefault0 , P ... = ... __WallyType0"),
             "{}",
             output
         );
@@ -1091,6 +1420,522 @@ return { text = text }
         );
         assert!(output.contains("Literal : \"Leaf\""), "{}", output);
         assert!(!output.contains("typeof"), "{}", output);
+    }
+
+    #[test]
+    fn generic_defaults_resolve_self_and_later_names_before_binding_them() {
+        let output = forward(
+            "return require(\"./target\")\n".into(),
+            &declarations("type T = string\ntype U = number\nexport type Box<T = T, U = U, V = T> = { First: T, Second: U, Third: V }\nreturn {}").unwrap(),
+        );
+        assert!(output.contains("type __WallyType0 = string"), "{}", output);
+        assert!(output.contains("type __WallyType1 = number"), "{}", output);
+        assert!(
+            output.contains("export type Box< T = __WallyType0 , U = __WallyType1 , V = T >"),
+            "{}",
+            output
+        );
+
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "local Types = require(\"@self/Types\")\nexport type T = boolean\nexport type Box<U = Types.Value> = U\nreturn {}");
+        write(
+            temp.path(),
+            "Types.luau",
+            "type T = string\nexport type Value<T = T> = { Value: T }\nreturn nil",
+        );
+        let output = generated(temp.path());
+        assert!(output.contains("type __WallyType0 = string"), "{}", output);
+        assert!(
+            output.contains("type __WallyType1 < T = __WallyType0 > = { Value : T }"),
+            "{}",
+            output
+        );
+
+        write(temp.path(), "Types.luau", "type Later = number\nexport type Value<T = Later, Later = T> = { First: T, Second: Later }\nreturn nil");
+        let output = generated(temp.path());
+        assert!(output.contains("type __WallyType0 = number"), "{}", output);
+        assert!(output.contains("type __WallyType1 < T = __WallyType0 , Later = T > = { First : T , Second : Later }"), "{}", output);
+        assert!(
+            output.contains("type __WallyDefault0 = __WallyType1"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("export type Box< U = __WallyDefault0 >"),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn omitted_and_explicit_generic_defaults_use_distinct_fresh_deferred_aliases() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Box<T = Types.Value, U = Types.Value<string>, __WallyDefault0 = Types.Value> = { First: T, Second: U }\nreturn {}");
+        write(
+            temp.path(),
+            "Types.luau",
+            "export type Value<T = number> = { Value: T }\nreturn nil",
+        );
+        let output = generated(temp.path());
+        assert!(
+            output.contains("type __WallyType0 < T = number > = { Value : T }"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("type __WallyDefault0_ = __WallyType0"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("type __WallyDefault1 = __WallyType0 < string >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains(
+                "T = __WallyDefault0_ , U = __WallyDefault1 , __WallyDefault0 = __WallyDefault0_"
+            ),
+            "{}",
+            output
+        );
+        assert_eq!(
+            output.matches("type __WallyDefault").count(),
+            2,
+            "{}",
+            output
+        );
+        assert_eq!(generated(temp.path()), output);
+    }
+
+    fn application_output(entry: &str, imported: &str) -> String {
+        let temp = TempDir::new().unwrap();
+        write(
+            temp.path(),
+            "init.luau",
+            &format!("local Types = require(script.Types)\n{entry}\nreturn {{}}"),
+        );
+        write(
+            temp.path(),
+            "Types.luau",
+            &format!("{imported}\nreturn nil"),
+        );
+        let output = generated(temp.path());
+        assert_eq!(generated(temp.path()), output);
+        output
+    }
+
+    #[test]
+    fn closed_explicit_default_defers_the_entire_application() {
+        let output = application_output(
+            "export type Box<T = Types.Value<string>> = T",
+            "export type Value<T> = { Value: T }",
+        );
+        assert!(
+            output.contains("type __WallyDefault0 = __WallyType0 < string >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("export type Box< T = __WallyDefault0 >"),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn compound_earlier_type_capture_is_a_generic_helper_not_a_global() {
+        let output = application_output(
+            "export type Box<T = string, U = Types.Value<{ Inner: T }>> = U",
+            "export type Value<T> = { Value: T }",
+        );
+        assert!(
+            output.contains("type __WallyDefault0<T> = __WallyType0 < { Inner : T } >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("T = string , U = __WallyDefault0 < T >"),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn mixed_earlier_pack_capture_groups_the_sole_target_pack() {
+        let output = application_output(
+            "export type Box<P... = (string, number), Q... = (Types.Value<boolean, P...>)> = (Q...) -> Q...",
+            "export type Value<P...> = (P...) -> P...",
+        );
+        assert!(
+            output.contains("type __WallyDefault0<P...> = __WallyType0 < ( boolean , P ... ) >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Q ... = ( __WallyDefault0 < P ... > )"),
+            "{}",
+            output
+        );
+        let output = application_output(
+            "export type Box<T = string, P... = (number), Q... = (Types.Value<T, boolean, P...>)> = (Q...) -> ()",
+            "export type Value<T, P...> = { Item: T, Call: (P...) -> () }",
+        );
+        assert!(
+            output.contains("__WallyType0 < T , ( boolean , P ... ) >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Q ... = ( __WallyDefault0 < T , P ... > )"),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn nested_applications_defer_children_before_building_the_parent_body() {
+        let output = application_output(
+            "export type Box<T = string, U = Types.Value<Types.Value<{ Inner: T }>>> = U",
+            "export type Value<T> = { Value: T }",
+        );
+        assert!(
+            output.contains("type __WallyDefault0<T> = __WallyType0 < __WallyDefault1 < T > >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("type __WallyDefault1<T> = __WallyType0 < { Inner : T } >"),
+            "{}",
+            output
+        );
+        assert!(output.contains("U = __WallyDefault0 < T >"), "{}", output);
+    }
+
+    #[test]
+    fn application_captures_avoid_tokens_and_preserve_callback_shadowing() {
+        let output = application_output(
+            "type __WallyDefault0 = string\nexport type Box<T = string, U = Types.Value<{ Outer: T, Call: <T>(T) -> T, Pack: <T...>(T, T...) -> T }>> = U",
+            "type __WallyDefault0_ = number\nexport type Value<T> = { Value: T }",
+        );
+        assert!(output.contains("type __WallyDefault0__<T>"), "{}", output);
+        assert!(
+            output.contains(
+                "Outer : T , Call : < T > ( T ) -> T , Pack : < T ... > ( T , T ... ) -> T"
+            ),
+            "{}",
+            output
+        );
+        assert!(output.contains("U = __WallyDefault0__ < T >"), "{}", output);
+        let output = application_output(
+            "export type Box<T = <T>(Types.Value<string>, <T>(Types.Value<number>) -> T) -> T> = T",
+            "export type Value<T> = { Value: T }",
+        );
+        assert!(
+            output.contains("< T > ( __WallyDefault0 , < T > ( __WallyDefault1 ) -> T ) -> T"),
+            "{}",
+            output
+        );
+        assert_eq!(output.matches("type __WallyDefault").count(), 2);
+        let output = application_output(
+            "export type Box<T = string, U = <P...>(Types.Value<T>, P...) -> T> = U",
+            "export type Value<T> = { Value: T }",
+        );
+        assert!(
+            output.contains("type __WallyDefault0<T> = __WallyType0 < T >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("< P ... > ( __WallyDefault0 < T > , P ... ) -> T"),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn application_captures_keep_type_and_pack_namespaces_separate() {
+        let output = application_output(
+            "export type Box<T = string, P... = (number), Q... = (Types.Value<T, P...>)> = (Q...) -> ()",
+            "export type Value<T, P...> = { Item: T, Call: (P...) -> () }",
+        );
+        assert!(
+            output.contains("type __WallyDefault0<T, P...> = __WallyType0 < T , P ... >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Q ... = ( __WallyDefault0 < T , P ... > )"),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn explicit_deferral_preserves_recursive_bodies_and_real_multiple_packs() {
+        let output = application_output(
+            "export type Box<T = Types.Value<string>> = T",
+            "type Inner<T> = { Item: T }\nexport type Value<T, U = Inner<T>> = { Item: T, Other: U, Next: Value<T, U>? }",
+        );
+        assert!(output.contains("U = __WallyDefault1 < T >"), "{}", output);
+        assert!(
+            output.contains("Next : __WallyType1 < T , U > ?"),
+            "{}",
+            output
+        );
+        assert_eq!(output.matches("type __WallyDefault").count(), 2);
+        let output = application_output(
+            "export type Box<T = Types.Value<(string), (number)>> = T",
+            "export type Value<P..., Q...> = { First: (P...) -> (), Second: (Q...) -> () }",
+        );
+        assert!(
+            output.contains("type __WallyDefault0 = __WallyType0 < ( string ) , ( number ) >"),
+            "{}",
+            output
+        );
+        let output = application_output(
+            "export type Box<T = Types.Value<(string)>> = T",
+            "export type Value<P..., Q... = (number)> = { First: (P...) -> (), Second: (Q...) -> () }",
+        );
+        assert!(output.contains("Q ... = ( number )"), "{}", output);
+        assert!(
+            output.contains("type __WallyDefault0 = __WallyType0 < ( string ) >"),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn rejects_captures_the_legacy_analyzer_cannot_instantiate_safely() {
+        for (entry, message) in [
+            (
+                "export type Box<T = <T>(Types.Value<T>) -> T> = T",
+                "capturing callback-local generic T",
+            ),
+            (
+                "export type Box<T = string, U = <P...>(Types.Fixed<T, P...>) -> T> = U",
+                "capturing callback-local generic P",
+            ),
+            (
+                "export type Box<T = string, U = <T...>(Types.Fixed<T, T...>) -> T> = U",
+                "use distinct type and pack binder names",
+            ),
+            (
+                "export type Box<T = <T>(<T>(Types.Value<T>) -> T) -> T> = T",
+                "capturing callback-local generic T",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(
+                temp.path(),
+                "init.luau",
+                &format!("local Types = require(script.Types)\n{entry}\nreturn {{}}"),
+            );
+            write(temp.path(), "Types.luau", "export type Value<T> = { Value: T }\nexport type Fixed<T, P...> = { Item: T, Call: (P...) -> () }\nreturn nil");
+            let error = format!("{:#}", exports(temp.path()).err().expect(entry));
+            assert!(error.contains(message), "{}", error);
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_pack_shapes_in_deferred_applications() {
+        for (entry, imported) in [
+            (
+                "export type Box<P..., Q... = (Types.Value<P..., P...>)> = (Q...) -> ()",
+                "export type Value<P...> = (P...) -> ()",
+            ),
+            (
+                "export type Box<T = Types.Value<string, number, boolean>> = T",
+                "export type Value<P..., Q...> = { First: (P...) -> (), Second: (Q...) -> () }",
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(
+                temp.path(),
+                "init.luau",
+                &format!("local Types = require(script.Types)\n{entry}\nreturn {{}}"),
+            );
+            write(
+                temp.path(),
+                "Types.luau",
+                &format!("{imported}\nreturn nil"),
+            );
+            let error = format!("{:#}", exports(temp.path()).err().expect(entry));
+            assert!(error.contains("ambiguous type-pack arguments"), "{}", error);
+            assert!(
+                error.contains("one explicit tuple per target pack"),
+                "{}",
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn pack_binders_do_not_hide_type_aliases_or_outer_type_parameters() {
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Box<T = Types.Value<number>> = T\nreturn {}");
+        write(temp.path(), "Types.luau", "type P = string\nexport type Value<T, P... = (P)> = { Bare: P, Bound: T, Call: (P...) -> T, Nested: <T...>(T, T...) -> (P, T...) }\nreturn nil");
+        let output = generated(temp.path());
+        assert!(output.contains("type __WallyType0 = string"), "{}", output);
+        assert!(
+            output.contains("type __WallyType1 < T , P ... = ( __WallyType0 ) >"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Bare : __WallyType0 , Bound : T , Call : ( P ... ) -> T"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains("Nested : < T ... > ( T , T ... ) -> ( __WallyType0 , T ... )"),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn nested_callback_bindings_are_separate_and_do_not_escape_their_scope() {
+        let temp = TempDir::new().unwrap();
+        write(
+            temp.path(),
+            "init.luau",
+            "local Types = require(script.Types)\nexport type Box<T = Types.Value> = T\nreturn {}",
+        );
+        write(temp.path(), "Types.luau", "type P = number\ntype T = string\nexport type Value = { Call: <T>(T, <P...>(P, T, P...) -> T) -> T, After: T, Other: <P...>(P, P...) -> P }\nreturn nil");
+        let output = generated(temp.path());
+        assert!(output.contains("type __WallyType0 = number"), "{}", output);
+        assert!(output.contains("type __WallyType1 = string"), "{}", output);
+        assert!(
+            output
+                .contains("Call : < T > ( T , < P ... > ( __WallyType0 , T , P ... ) -> T ) -> T"),
+            "{}",
+            output
+        );
+        assert!(
+            output.contains(
+                "After : __WallyType1 , Other : < P ... > ( __WallyType0 , P ... ) -> __WallyType0"
+            ),
+            "{}",
+            output
+        );
+    }
+
+    #[test]
+    fn rejects_free_imported_types_captured_by_entrypoint_exports() {
+        for declaration in [
+            "export type Value = Vector3",
+            "local Vector3 = {}\nexport type Value = { Value: Vector3 }",
+            "export type Value<Vector3 = Vector3> = Vector3",
+            "export type Value<T = Vector3, Vector3 = T> = T",
+            "export type Value = <Vector3...>(Vector3, Vector3...) -> ()",
+            "export type Value = <T>(T, <Vector3...>(Vector3) -> T) -> T",
+            "export type Value = Vector3<number>",
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Vector3 = string\nexport type Box<T = Types.Value> = T\nreturn {}");
+            write(
+                temp.path(),
+                "Types.luau",
+                &format!("{declaration}\nreturn nil"),
+            );
+            let error = format!("{:#}", exports(temp.path()).err().expect(declaration));
+            assert!(
+                error.contains(
+                    "Free imported type Vector3 would be captured by entrypoint export Vector3"
+                ),
+                "{}\n{}",
+                declaration,
+                error
+            );
+            assert!(error.contains("rename the entrypoint export"), "{}", error);
+        }
+    }
+
+    #[test]
+    fn imported_aliases_and_bound_generics_precede_global_capture_checks() {
+        for declaration in [
+            "type Vector3 = number\nexport type Value = Vector3",
+            "export type Vector3 = number\nexport type Value = Vector3",
+            "export type Value<Vector3 = number, T = Vector3> = { Value: Vector3, Other: T }",
+            "export type Value = <Vector3>(Vector3) -> Vector3",
+            "export type Value<Vector3...> = (Vector3...) -> Vector3...",
+            "export type Value = <Vector3...>(Vector3...) -> Vector3...",
+            "type Vector3 = number\nexport type Value<Vector3 = Vector3> = Vector3",
+            "type Unreachable = Vector3\nexport type Value = number",
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(temp.path(), "init.luau", "local Types = require(script.Types)\nexport type Vector3 = string\nexport type Box<T = Types.Value> = T\nreturn {}");
+            write(
+                temp.path(),
+                "Types.luau",
+                &format!("{declaration}\nreturn nil"),
+            );
+            generated(temp.path());
+        }
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "local Types = require(script.Types)\ntype Vector3 = string\nexport type Box<T = Types.Value> = T\nreturn {}");
+        write(
+            temp.path(),
+            "Types.luau",
+            "export type Value = Vector3\nreturn nil",
+        );
+        let output = generated(temp.path());
+        assert!(output.contains("type __WallyType0 = Vector3"), "{}", output);
+        assert!(!output.contains("= string"), "{}", output);
+    }
+
+    #[test]
+    fn generic_type_binders_do_not_shadow_qualified_value_import_namespaces() {
+        for parameter in [
+            "Types, T = Types.Value",
+            "T = <Types>(Types.Value, Types) -> Types",
+            "T = <Types...>(Types.Value, Types...) -> Types...",
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(temp.path(), "init.luau", &format!("local Types = require(script.Types)\nexport type Box<{parameter}> = T\nreturn {{}}"));
+            write(temp.path(), "Types.luau", "local Inner = require(\"./Inner\")\nexport type Value<Inner = number, T = Inner.Value> = { Value: T, Other: Inner }\nreturn nil");
+            write(
+                temp.path(),
+                "Inner.luau",
+                "export type Value = string\nreturn nil",
+            );
+            let output = generated(temp.path());
+            assert!(output.contains("type __WallyType0 = string"), "{}", output);
+            assert!(
+                output.contains("type __WallyType1 < Inner = number , T = __WallyType0 >"),
+                "{}",
+                output
+            );
+        }
+        for binding in [
+            "local Types = runtime",
+            "local Types = require(script.Types)\nTypes = {}",
+            "local Types = require(\"../outside\")",
+            "do local Types = require(script.Types) end",
+            "",
+        ] {
+            let temp = TempDir::new().unwrap();
+            write(
+                temp.path(),
+                "init.luau",
+                &format!("{binding}\nexport type Box<Types, T = Types.Value> = T\nreturn {{}}"),
+            );
+            write(
+                temp.path(),
+                "Types.luau",
+                "export type Value = string\nreturn nil",
+            );
+            assert!(exports(temp.path()).is_err(), "{}", binding);
+        }
+        let temp = TempDir::new().unwrap();
+        write(temp.path(), "init.luau", "export type Box<Types, T = Types.Value> = T\nlocal Types = require(script.Types)\nreturn {}");
+        write(
+            temp.path(),
+            "Types.luau",
+            "export type Value = string\nreturn nil",
+        );
+        assert!(exports(temp.path()).is_err());
     }
 
     #[test]
@@ -1159,7 +2004,7 @@ return { text = text }
             output
         );
         assert!(
-            output.contains("P ... = ( __WallyType1 , string )"),
+            output.contains("P ... = ( __WallyDefault0 , string )"),
             "{}",
             output
         );
