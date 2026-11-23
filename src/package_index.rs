@@ -13,6 +13,7 @@ use url::Url;
 use crate::git_util;
 use crate::manifest::Manifest;
 use crate::package_name::PackageName;
+use crate::terminal_style::{self, Style};
 
 /// Configuration contained in the index's `config.json` file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,9 +98,13 @@ impl PackageIndex {
     pub fn update(&self) -> anyhow::Result<()> {
         let repository = self.repository.lock().unwrap();
 
-        log::info!(
-            "Updating package index {}...",
-            repository.find_remote("origin")?.url().unwrap()
+        eprintln!(
+            "{}",
+            terminal_style::updating_index(
+                Style::from_env(),
+                repository.find_remote("origin")?.url().unwrap(),
+                dirs::home_dir().as_deref(),
+            )
         );
         git_util::update_index(self.access_token.clone(), &repository)
             .with_context(|| format!("could not update package index"))?;
