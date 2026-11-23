@@ -6,10 +6,11 @@
 use std::fmt::Display;
 use std::path::Path;
 
-// Raw SGR pairs keep the 16-color codes the other CLIs use, where crossterm would emit
-// 256-color sequences. Each pair closes only what it opened.
+// Raw SGR pairs match the exact codes the other CLIs use, where crossterm would emit
+// 256-color sequences. Each pair closes only what it opened. Muted text uses the
+// commandline-luau theme's gray (#a8a8a8) so it stays readable next to normal text.
 const COUNT: (&str, &str) = ("1;93", "22;39");
-const MUTED: (&str, &str) = ("90", "39");
+const MUTED: (&str, &str) = ("38;2;168;168;168", "39");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
@@ -141,7 +142,7 @@ mod tests {
 
     #[test]
     fn colored_style_uses_the_shared_palette() {
-        assert_eq!(COLOR.muted("x"), "\x1b[90mx\x1b[39m");
+        assert_eq!(COLOR.muted("x"), "\x1b[38;2;168;168;168mx\x1b[39m");
         assert_eq!(COLOR.count(15), "\x1b[1;93m15\x1b[22;39m");
         assert_eq!(
             downloaded(COLOR, 1),
@@ -149,7 +150,7 @@ mod tests {
         );
         assert_eq!(
             updating_index(COLOR, "https://example.com/index", None),
-            "Updating package index \x1b[90mhttps://example.com/index\x1b[39m..."
+            "Updating package index \x1b[38;2;168;168;168mhttps://example.com/index\x1b[39m..."
         );
     }
 
