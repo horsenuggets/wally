@@ -252,6 +252,7 @@ mod tests {
                     let sink = Arc::clone(&progress);
                     let inner = env_logger::Builder::new()
                         .parse_filters(filter)
+                        .is_test(true)
                         .target(env_logger::Target::Pipe(Box::new(Capture(Arc::clone(
                             &normal,
                         )))))
