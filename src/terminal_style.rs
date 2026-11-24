@@ -62,20 +62,23 @@ pub fn display_directory(path: &str, home: Option<&Path>) -> String {
     if let Some(home) = home.and_then(Path::to_str) {
         let home = home.replace('\\', "/");
         let home = home.trim_end_matches('/');
-        // Windows paths compare case-insensitively, so only fold case for drive paths.
+        // ASCII case folding preserves byte offsets, unlike Unicode lowercase expansion.
         let windows = display.as_bytes().get(1) == Some(&b':');
-        let (candidate, prefix) = if windows {
-            (display.to_lowercase(), home.to_lowercase())
-        } else {
-            (display.clone(), home.to_owned())
-        };
-        if !prefix.is_empty()
-            && (candidate == prefix || candidate.starts_with(&format!("{prefix}/")))
+        let matches_home = display.get(..home.len()).is_some_and(|prefix| {
+            if windows {
+                prefix.eq_ignore_ascii_case(home)
+            } else {
+                prefix == home
+            }
+        });
+        if !home.is_empty()
+            && matches_home
+            && (display.len() == home.len() || display.as_bytes().get(home.len()) == Some(&b'/'))
         {
             display = format!("~{}", &display[home.len()..]);
         }
     }
-    format!("{}/", display.trim_end_matches('/'))
+    format!("{}/", display.trim_end_matches('/')).replace(' ', "·")
 }
 
 /// Package indexes are usually URLs, but a local index is a directory on disk.
@@ -194,6 +197,14 @@ mod tests {
             "/home/username/index/"
         );
         assert_eq!(display_location("/home/user", Some(unix_home)), "~/");
+        assert_eq!(
+            display_location("/home/user/My Index", Some(unix_home)),
+            "~/My·Index/"
+        );
+        assert_eq!(
+            display_location("C:/İ/index", Some(Path::new("C:/i\u{307}"))),
+            "C:/İ/index/"
+        );
 
         let windows_home = Path::new("C:\\Users\\User");
         assert_eq!(
