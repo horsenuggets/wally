@@ -253,7 +253,13 @@ impl InstallationContext {
         }
 
         bar.finish_and_clear();
-        log::info!("Downloaded {} packages!", num_packages);
+        eprintln!(
+            "{}",
+            crate::terminal_style::downloaded(
+                crate::terminal_style::Style::from_env(),
+                num_packages
+            )
+        );
 
         Ok(())
     }
