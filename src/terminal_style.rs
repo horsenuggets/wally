@@ -4,7 +4,10 @@
 //! home folder to `~`, and end directories with `/`, on every platform.
 
 use std::fmt::Display;
+use std::io::IsTerminal;
 use std::path::Path;
+
+use log::{Level, Log, Metadata, Record};
 
 // Raw SGR pairs match the exact codes the other CLIs use, where crossterm would emit
 // 256-color sequences. Each pair closes only what it opened. Muted text uses the
@@ -22,9 +25,20 @@ impl Style {
         Self { color }
     }
 
-    /// Follows the `NO_COLOR` convention, where any non-empty value disables color.
-    pub fn from_env() -> Self {
-        Self::new(color_enabled(std::env::var_os("NO_COLOR").as_deref()))
+    pub fn from_stdout() -> Self {
+        Self::from_stream(std::io::stdout().is_terminal())
+    }
+
+    pub fn from_stderr() -> Self {
+        Self::from_stream(std::io::stderr().is_terminal())
+    }
+
+    fn from_stream(terminal: bool) -> Self {
+        Self::new(color_enabled(
+            std::env::var_os("NO_COLOR").as_deref(),
+            std::env::var_os("CLICOLOR_FORCE").as_deref(),
+            terminal,
+        ))
     }
 
     pub fn muted(&self, text: impl Display) -> String {
@@ -44,8 +58,83 @@ impl Style {
     }
 }
 
-fn color_enabled(no_color: Option<&std::ffi::OsStr>) -> bool {
+fn color_enabled(
+    no_color: Option<&std::ffi::OsStr>,
+    force: Option<&std::ffi::OsStr>,
+    terminal: bool,
+) -> bool {
     !matches!(no_color, Some(value) if !value.is_empty())
+        && (terminal || matches!(force, Some(value) if !value.is_empty() && value != "0"))
+}
+
+/// The CLI renders its two progress records as plain sentences. Library consumers still
+/// receive ordinary log records through their own logger, including their own filters.
+pub struct ProgressLogger<F> {
+    inner: env_logger::Logger,
+    progress: F,
+}
+
+impl<F> ProgressLogger<F> {
+    pub fn new(inner: env_logger::Logger, progress: F) -> Self {
+        Self { inner, progress }
+    }
+}
+
+impl<F: Fn(&Record<'_>) + Send + Sync> Log for ProgressLogger<F> {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.inner.matches(record) {
+            return;
+        }
+        if record.level() == Level::Info
+            && matches!(
+                record.target(),
+                "libwally::installation" | "libwally::package_index"
+            )
+        {
+            (self.progress)(record);
+        } else {
+            self.inner.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
+/// Styles progress only at the CLI boundary, after the plain record passed log filters.
+pub fn render_progress(record: &Record<'_>, style: Style) -> String {
+    let message = record.args().to_string();
+    if record.level() != Level::Info {
+        return message;
+    }
+    match record.target() {
+        "libwally::package_index" => {
+            if let Some(location) = message
+                .strip_prefix("Updating package index ")
+                .and_then(|value| value.strip_suffix("..."))
+            {
+                return format!("Updating package index {}...", style.muted(location));
+            }
+        }
+        "libwally::installation" => {
+            if let Some(count) = message
+                .strip_prefix("Downloaded ")
+                .and_then(|value| value.split_once(' '))
+                .and_then(|(count, _)| count.parse::<usize>().ok())
+            {
+                if message == downloaded(Style::new(false), count) {
+                    return downloaded(style, count);
+                }
+            }
+        }
+        _ => {}
+    }
+    message
 }
 
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -83,6 +172,13 @@ pub fn display_directory(path: &str, home: Option<&Path>) -> String {
 
 /// Package indexes are usually URLs, but a local index is a directory on disk.
 fn display_location(location: &str, home: Option<&Path>) -> String {
+    if let Ok(url) = url::Url::parse(location) {
+        if url.scheme() == "file" {
+            if let Ok(path) = url.to_file_path() {
+                return display_directory(&path.to_string_lossy(), home);
+            }
+        }
+    }
     if location.contains("://") {
         location.to_owned()
     } else {
@@ -125,10 +221,165 @@ mod tests {
     const COLOR: Style = Style { color: true };
 
     #[test]
-    fn no_color_disables_color_only_when_non_empty() {
-        assert!(color_enabled(None));
-        assert!(color_enabled(Some(OsStr::new(""))));
-        assert!(!color_enabled(Some(OsStr::new("1"))));
+    fn color_respects_stream_capability_force_and_no_color() {
+        for terminal in [false, true] {
+            for no_color in [None, Some(OsStr::new("")), Some(OsStr::new("1"))] {
+                for force in [
+                    None,
+                    Some(OsStr::new("")),
+                    Some(OsStr::new("0")),
+                    Some(OsStr::new("1")),
+                ] {
+                    let disabled = no_color.is_some_and(|value| !value.is_empty());
+                    let forced = force.is_some_and(|value| !value.is_empty() && value != "0");
+                    assert_eq!(
+                        color_enabled(no_color, force, terminal),
+                        !disabled && (terminal || forced)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_file_urls_display_as_paths_without_changing_remote_urls() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("My Index");
+        let location = url::Url::from_directory_path(path).unwrap();
+        assert_eq!(
+            display_location(location.as_str(), Some(home.path())),
+            "~/My·Index/"
+        );
+        assert_eq!(
+            display_location("https://example.com/My%20Index", Some(home.path())),
+            "https://example.com/My%20Index"
+        );
+    }
+
+    #[test]
+    fn cli_progress_preserves_logger_filters_and_other_log_destinations() {
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for filter in ["off", "trace", "trace/does-not-match"] {
+            let enabled = filter == "trace";
+            for target in [
+                "libwally::installation",
+                "libwally::package_index",
+                "libwally::other",
+            ] {
+                for level in [Level::Info, Level::Warn] {
+                    let normal = Arc::new(Mutex::new(Vec::new()));
+                    let progress = Arc::new(Mutex::new(Vec::new()));
+                    let sink = Arc::clone(&progress);
+                    let inner = env_logger::Builder::new()
+                        .parse_filters(filter)
+                        .is_test(true)
+                        .target(env_logger::Target::Pipe(Box::new(Capture(Arc::clone(
+                            &normal,
+                        )))))
+                        .format(|buffer, record| {
+                            use std::io::Write;
+                            writeln!(buffer, "{}", record.args())
+                        })
+                        .build();
+                    let logger = ProgressLogger::new(inner, move |record: &Record<'_>| {
+                        sink.lock().unwrap().push(record.args().to_string())
+                    });
+                    logger.log(
+                        &Record::builder()
+                            .args(format_args!("A message."))
+                            .level(level)
+                            .target(target)
+                            .build(),
+                    );
+                    let plain = enabled && level == Level::Info && target != "libwally::other";
+                    assert_eq!(
+                        *progress.lock().unwrap(),
+                        if plain { vec!["A message."] } else { vec![] }
+                    );
+                    assert_eq!(
+                        *normal.lock().unwrap(),
+                        if enabled && !plain {
+                            b"A message.\n".to_vec()
+                        } else {
+                            vec![]
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cli_styling_happens_after_plain_record_regex_filtering() {
+        use std::sync::{Arc, Mutex};
+
+        for (target, plain, colored, filter) in [
+            (
+                "libwally::installation",
+                downloaded(PLAIN, 3),
+                downloaded(COLOR, 3),
+                "info/^Downloaded 3 packages!$",
+            ),
+            (
+                "libwally::package_index",
+                updating_index(PLAIN, "https://example.com/index", None),
+                updating_index(COLOR, "https://example.com/index", None),
+                r"info/^Updating package index https:.+index\.\.\.$",
+            ),
+        ] {
+            let rendered = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&rendered);
+            let inner = env_logger::Builder::new().parse_filters(filter).build();
+            let logger = ProgressLogger::new(inner, move |record: &Record<'_>| {
+                assert!(!record.args().to_string().contains('\x1b'));
+                sink.lock().unwrap().push(render_progress(record, COLOR));
+            });
+            logger.log(
+                &Record::builder()
+                    .args(format_args!("{}", plain))
+                    .level(Level::Info)
+                    .target(target)
+                    .build(),
+            );
+            assert_eq!(*rendered.lock().unwrap(), vec![colored]);
+        }
+    }
+
+    #[test]
+    fn cli_renderer_leaves_other_records_unchanged() {
+        for (target, level, text) in [
+            ("libwally::other", Level::Info, "Downloaded 3 packages!"),
+            (
+                "libwally::installation",
+                Level::Warn,
+                "Downloaded 3 packages!",
+            ),
+            ("libwally::installation", Level::Info, "Downloaded 3 files!"),
+            ("libwally::package_index", Level::Info, "Another message."),
+        ] {
+            assert_eq!(
+                render_progress(
+                    &Record::builder()
+                        .args(format_args!("{}", text))
+                        .level(level)
+                        .target(target)
+                        .build(),
+                    COLOR,
+                ),
+                text
+            );
+        }
     }
 
     #[test]

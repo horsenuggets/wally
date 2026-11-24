@@ -98,7 +98,7 @@ fn synchronize(
 }
 
 fn report_refresh(count: usize) {
-    if let Some(message) = terminal_style::refreshed(Style::from_env(), count) {
+    if let Some(message) = terminal_style::refreshed(Style::from_stdout(), count) {
         println!("{message}");
     }
 }
