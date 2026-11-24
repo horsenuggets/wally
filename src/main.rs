@@ -16,12 +16,19 @@ fn main() {
 
     let log_env = env_logger::Env::default().default_filter_or(log_filter);
 
-    env_logger::Builder::from_env(log_env)
+    let logger = env_logger::Builder::from_env(log_env)
         .format_module_path(false)
         .format_timestamp(None)
         // Indent following lines equal to the log level label, like `[ERROR] `
         .format_indent(Some(8))
-        .init();
+        .build();
+    let filter = logger.filter();
+    log::set_boxed_logger(Box::new(libwally::terminal_style::ProgressLogger::new(
+        logger,
+        |record: &log::Record<'_>| eprintln!("{}", record.args()),
+    )))
+    .expect("The CLI logger must only be initialized once.");
+    log::set_max_level(filter);
 
     if let Err(err) = args.run() {
         eprintln!("{:?}", err);

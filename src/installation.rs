@@ -253,10 +253,10 @@ impl InstallationContext {
         }
 
         bar.finish_and_clear();
-        eprintln!(
+        log::info!(
             "{}",
             crate::terminal_style::downloaded(
-                crate::terminal_style::Style::from_env(),
+                crate::terminal_style::Style::from_stderr(),
                 num_packages
             )
         );

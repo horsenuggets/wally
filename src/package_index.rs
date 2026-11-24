@@ -98,10 +98,10 @@ impl PackageIndex {
     pub fn update(&self) -> anyhow::Result<()> {
         let repository = self.repository.lock().unwrap();
 
-        eprintln!(
+        log::info!(
             "{}",
             terminal_style::updating_index(
-                Style::from_env(),
+                Style::from_stderr(),
                 repository.find_remote("origin")?.url().unwrap(),
                 dirs::home_dir().as_deref(),
             )
