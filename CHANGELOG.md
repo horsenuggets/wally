@@ -11,7 +11,10 @@
 * Styled package-index locations and package counts with the shared CLI palette.
 * Printed installation and local-mirror progress as sentences while preserving watcher
   readiness messages and the `NO_COLOR` convention.
-* Normalized local index directory paths across platforms without changing real paths.
+* Normalized local index directory paths and file URLs across platforms without changing
+  real paths.
+* Preserved logging filters and custom logger destinations, and kept redirected output
+  plain unless its consumer explicitly requests color.
 
 ## `0.3.2-horse.6.2`
 * Preserved generic defaults that reference statically imported package types, including
