@@ -7,6 +7,12 @@
 [#119]: https://github.com/UpliftGames/wally/pull/119
 [#214]: https://github.com/UpliftGames/wally/pull/214
 
+## `0.3.2-horse.6.3`
+* Styled package-index locations and package counts with the shared CLI palette.
+* Printed installation and local-mirror progress as sentences while preserving watcher
+  readiness messages and the `NO_COLOR` convention.
+* Normalized local index directory paths across platforms without changing real paths.
+
 ## `0.3.2-horse.6.2`
 * Preserved generic defaults that reference statically imported package types, including
   Fusion scope constructors, without adding runtime imports or widening public types.

@@ -3952,7 +3952,7 @@ dependencies = [
 
 [[package]]
 name = "wally"
-version = "0.3.2-horse.6.2"
+version = "0.3.2-horse.6.3"
 dependencies = [
  "anyhow",
  "blake3",
