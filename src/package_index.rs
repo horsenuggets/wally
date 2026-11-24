@@ -101,7 +101,7 @@ impl PackageIndex {
         log::info!(
             "{}",
             terminal_style::updating_index(
-                Style::from_stderr(),
+                Style::new(false),
                 repository.find_remote("origin")?.url().unwrap(),
                 dirs::home_dir().as_deref(),
             )

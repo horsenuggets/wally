@@ -256,7 +256,7 @@ impl InstallationContext {
         log::info!(
             "{}",
             crate::terminal_style::downloaded(
-                crate::terminal_style::Style::from_stderr(),
+                crate::terminal_style::Style::new(false),
                 num_packages
             )
         );

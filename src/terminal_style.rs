@@ -106,6 +106,37 @@ impl<F: Fn(&Record<'_>) + Send + Sync> Log for ProgressLogger<F> {
     }
 }
 
+/// Styles progress only at the CLI boundary, after the plain record passed log filters.
+pub fn render_progress(record: &Record<'_>, style: Style) -> String {
+    let message = record.args().to_string();
+    if record.level() != Level::Info {
+        return message;
+    }
+    match record.target() {
+        "libwally::package_index" => {
+            if let Some(location) = message
+                .strip_prefix("Updating package index ")
+                .and_then(|value| value.strip_suffix("..."))
+            {
+                return format!("Updating package index {}...", style.muted(location));
+            }
+        }
+        "libwally::installation" => {
+            if let Some(count) = message
+                .strip_prefix("Downloaded ")
+                .and_then(|value| value.split_once(' '))
+                .and_then(|(count, _)| count.parse::<usize>().ok())
+            {
+                if message == downloaded(Style::new(false), count) {
+                    return downloaded(style, count);
+                }
+            }
+        }
+        _ => {}
+    }
+    message
+}
+
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 {
         singular
@@ -286,6 +317,68 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cli_styling_happens_after_plain_record_regex_filtering() {
+        use std::sync::{Arc, Mutex};
+
+        for (target, plain, colored, filter) in [
+            (
+                "libwally::installation",
+                downloaded(PLAIN, 3),
+                downloaded(COLOR, 3),
+                "info/^Downloaded 3 packages!$",
+            ),
+            (
+                "libwally::package_index",
+                updating_index(PLAIN, "https://example.com/index", None),
+                updating_index(COLOR, "https://example.com/index", None),
+                r"info/^Updating package index https:.+index\.\.\.$",
+            ),
+        ] {
+            let rendered = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&rendered);
+            let inner = env_logger::Builder::new().parse_filters(filter).build();
+            let logger = ProgressLogger::new(inner, move |record: &Record<'_>| {
+                assert!(!record.args().to_string().contains('\x1b'));
+                sink.lock().unwrap().push(render_progress(record, COLOR));
+            });
+            logger.log(
+                &Record::builder()
+                    .args(format_args!("{}", plain))
+                    .level(Level::Info)
+                    .target(target)
+                    .build(),
+            );
+            assert_eq!(*rendered.lock().unwrap(), vec![colored]);
+        }
+    }
+
+    #[test]
+    fn cli_renderer_leaves_other_records_unchanged() {
+        for (target, level, text) in [
+            ("libwally::other", Level::Info, "Downloaded 3 packages!"),
+            (
+                "libwally::installation",
+                Level::Warn,
+                "Downloaded 3 packages!",
+            ),
+            ("libwally::installation", Level::Info, "Downloaded 3 files!"),
+            ("libwally::package_index", Level::Info, "Another message."),
+        ] {
+            assert_eq!(
+                render_progress(
+                    &Record::builder()
+                        .args(format_args!("{}", text))
+                        .level(level)
+                        .target(target)
+                        .build(),
+                    COLOR,
+                ),
+                text
+            );
         }
     }
 

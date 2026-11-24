@@ -25,7 +25,15 @@ fn main() {
     let filter = logger.filter();
     log::set_boxed_logger(Box::new(libwally::terminal_style::ProgressLogger::new(
         logger,
-        |record: &log::Record<'_>| eprintln!("{}", record.args()),
+        |record: &log::Record<'_>| {
+            eprintln!(
+                "{}",
+                libwally::terminal_style::render_progress(
+                    record,
+                    libwally::terminal_style::Style::from_stderr(),
+                )
+            )
+        },
     )))
     .expect("The CLI logger must only be initialized once.");
     log::set_max_level(filter);
