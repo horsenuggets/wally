@@ -7,6 +7,7 @@ use anyhow::{ensure, Context};
 use structopt::StructOpt;
 
 use crate::local_sync::{LocalSync, SourceChanged};
+use crate::terminal_style::{self, Style};
 
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -97,11 +98,8 @@ fn synchronize(
 }
 
 fn report_refresh(count: usize) {
-    if count > 0 {
-        println!(
-            "Refreshed {count} local package {}.",
-            if count == 1 { "mirror" } else { "mirrors" }
-        );
+    if let Some(message) = terminal_style::refreshed(Style::from_stdout(), count) {
+        println!("{message}");
     }
 }
 

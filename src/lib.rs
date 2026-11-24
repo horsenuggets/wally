@@ -15,6 +15,7 @@ pub mod package_name;
 pub mod package_req;
 pub mod package_source;
 pub mod resolution;
+pub mod terminal_style;
 pub mod test_package;
 
 pub use commands::*;
